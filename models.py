@@ -19,6 +19,8 @@ class ImageEncoder(Module):
     def __init__(self, image_size=7):
         super(ImageEncoder, self).__init__()
 
+        self.image_size = image_size
+
         self.net = torchvision.models.DenseNet(num_init_features=64, growth_rate=32, block_config=(6, 12, 24, 16))
 
     def load_state_dict(self, state_dict):
@@ -55,7 +57,7 @@ class LSTMCell(Module):
         self.input_size = input_size
         self.hidden_size = hidden_size
 
-        self.fc = Linear(input_size, 5 * hidden_size)
+        self.fc = Linear(input_size + hidden_size, 5 * hidden_size)
 
     def forward(self, x, _h, _m):
         xh = torch.cat([x, _h], dim=1)
@@ -92,8 +94,8 @@ class AdaptiveAttention(Module):
         s: [batch_size, hidden_size]
         '''
 
-        _h = _h.unsqueeze_(_h, 1)
-        _s = _s.unsqueeze_(_s, 1)
+        _h = _h.unsqueeze_(1)
+        _s = _s.unsqueeze_(1)
 
         v = self.fc_v(_v)
         h = self.fc_h(_h)
@@ -111,6 +113,7 @@ class AdaptiveAttention(Module):
 class SetenceDecoder(Module):
     def __init__(self,
                  vocab_size,
+                 image_size,
                  image_embedding_size,
                  embedding_size,
                  hidden_size):
@@ -118,7 +121,7 @@ class SetenceDecoder(Module):
         super(SetenceDecoder, self).__init__()
 
         self.word_embedding = Embedding(vocab_size, embedding_size)
-        self.fc_v = Linear(1024, embedding_size)
+        self.fc_v = Linear(image_embedding_size, embedding_size)
         self.fc_h = Linear(embedding_size, hidden_size)
         self.fc_m = Linear(embedding_size, hidden_size)
         self.lstm_cell = LSTMCell(2 * embedding_size, hidden_size)
@@ -162,9 +165,12 @@ class SetenceDecoder(Module):
 if __name__ == '__main__':
 
     device = torch.device('cuda')
-    image_encoder = ImageEncoder().to(device)
+    image_encoder = ImageEncoder(
+        image_size=7,
+    ).to(device)
     sentence_decoder = SetenceDecoder(
         vocab_size=1337,
+        image_size=7,
         image_embedding_size=image_encoder.image_embedding_size,
         embedding_size=256,
         hidden_size=256,
