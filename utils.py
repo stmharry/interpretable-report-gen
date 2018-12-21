@@ -101,6 +101,7 @@ def iterate_csv(base_path, dataframe, word_freq, max_len, stopword=False):
                 'namepattern','which','every','also','should','if','it','been','who','during', 'x']
     stop_words.extend(my_new_stop_words)
     stop_words = set(stop_words)
+    tokenizer = nltk.tokenize.punkt.PunktSentenceTokenizer()
 
     for idx, row in dataframe.iterrows():
         if (str(row['dicom_id']) + '.dcm') in image_files and (str(row['rad_id']) + '.txt') in report_files:
@@ -110,7 +111,7 @@ def iterate_csv(base_path, dataframe, word_freq, max_len, stopword=False):
 
             parsed_report = parse_report(report_path)
             if 'findings' in parsed_report:
-                sentences = nltk.tokenize.punkt.PunktSentenceTokenizer()
+                sentences = tokenizer.tokenize(parse_report['findings'])
                 for sentence in sentences:
                     tokens = word_tokenize(sentence)
                     if stopword:
