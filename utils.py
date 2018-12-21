@@ -234,3 +234,6 @@ def create_input_files(dataset, base_path, min_word_freq, output_folder,
 
             with open(os.path.join(output_folder, split + '_SENLENS_' + base_filename + '.json'), 'w') as j:
                 json.dump(total_senlens, j)
+
+if __name__ == "__main__":
+    create_input_files('mimiccxr','/crimea/mimic-cxr',5,'/crimea/liuguanx/mimic-output')
