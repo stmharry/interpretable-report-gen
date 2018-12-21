@@ -111,7 +111,7 @@ def iterate_csv(base_path, dataframe, word_freq, max_len, stopword=False):
 
             parsed_report = parse_report(report_path)
             if 'findings' in parsed_report:
-                sentences = tokenizer.tokenize(parse_report['findings'])
+                sentences = tokenizer.tokenize(parsed_report['findings'])
                 for sentence in sentences:
                     tokens = word_tokenize(sentence)
                     if stopword:
