@@ -110,14 +110,16 @@ def iterate_csv(base_path, dataframe, word_freq, max_len, stopword=False):
 
             parsed_report = parse_report(report_path)
             if 'findings' in parsed_report:
-                tokens = word_tokenize(parsed_report['findings'])
-                if stopword:
-                    filtered_tokens = [w for w in tokens if not w in stop_words]
-                else:
-                    filtered_tokens = tokens
-                word_freq.update(filtered_tokens)
-                if len(filtered_tokens) <= max_len:
-                    report.append(filtered_tokens)
+                sentences = nltk.tokenize.punkt.PunktSentenceTokenizer()
+                for sentence in sentences:
+                    tokens = word_tokenize(sentence)
+                    if stopword:
+                        filtered_tokens = [w for w in tokens if not w in stop_words]
+                    else:
+                        filtered_tokens = tokens
+                    word_freq.update(filtered_tokens)
+                    if len(filtered_tokens) <= max_len:
+                        report.append(filtered_tokens)
                 if len(report) == 0:
                     continue
 
@@ -127,7 +129,7 @@ def iterate_csv(base_path, dataframe, word_freq, max_len, stopword=False):
     return image_paths, image_report
 
 
-def create_input_files(dataset, base_path, reports_per_image, min_word_freq, output_folder,
+def create_input_files(dataset, base_path, min_word_freq, output_folder,
                        max_len=100):
 
     assert dataset in {'mimiccxr'}
@@ -150,14 +152,14 @@ def create_input_files(dataset, base_path, reports_per_image, min_word_freq, out
     # Read image paths and reports for each image
     word_freq = Counter()
 
-    train_image_paths, train_image_reports = iterate_csv(base_path,train,word_freq,max_len)
-    val_image_paths, val_image_reports = iterate_csv(base_path,val,word_freq,max_len)
-    test_image_paths, test_image_reports = iterate_csv(base_path,test,word_freq,max_len)
+    train_image_paths, train_image_sentences = iterate_csv(base_path,train,word_freq,max_len)
+    val_image_paths, val_image_sentences = iterate_csv(base_path,val,word_freq,max_len)
+    test_image_paths, test_image_sentences = iterate_csv(base_path,test,word_freq,max_len)
 
     # Sanity check
-    assert len(train_image_paths) == len(train_image_reports)
-    assert len(val_image_paths) == len(val_image_reports)
-    assert len(test_image_paths) == len(test_image_reports)
+    assert len(train_image_paths) == len(train_image_sentences)
+    assert len(val_image_paths) == len(val_image_sentences)
+    assert len(test_image_paths) == len(test_image_sentences)
 
     # Create word map
     words = [w for w in word_freq.keys() if word_freq[w] > min_word_freq]
@@ -168,35 +170,32 @@ def create_input_files(dataset, base_path, reports_per_image, min_word_freq, out
     word_map['<pad>'] = 0
 
     # Create a base/root name for all output files
-    base_filename = dataset + '_' + str(reports_per_image) + '_rep_per_img_' + str(min_word_freq) + '_min_word_freq'
+    base_filename = dataset + '_' + str(min_word_freq) + '_min_word_freq'
 
     # Save word map to a JSON
     with open(os.path.join(output_folder, 'WORDMAP_' + base_filename + '.json'), 'w') as j:
         json.dump(word_map, j)
 
     # Save images to HDF5 file, and report and their lengths to JSON files
-    for impaths, imcaps, split in [(train_image_paths, train_image_reports, 'TRAIN'),
-                                   (val_image_paths, val_image_reports, 'VAL'),
-                                   (test_image_paths, test_image_reports, 'TEST')]:
+    for impaths, imcaps, split in [(train_image_paths, train_image_sentences, 'TRAIN'),
+                                   (val_image_paths, val_image_sentences, 'VAL'),
+                                   (test_image_paths, test_image_sentences, 'TEST')]:
 
         with h5py.File(os.path.join(output_folder, split + '_IMAGES_' + base_filename + '.hdf5'), 'a') as h:
-            h.attrs['reports_per_image'] = reports_per_image
+
             # Create dataset inside HDF5 file to store images
             images = h.create_dataset('images', (len(impaths), 3, 256, 256), dtype='uint8')
 
             print("\nReading %s images and reports, storing to file...\n" % split)
 
-            enc_reports = []
-            replens = []
+            total_enc_sentences = []
+            total_senlens = []
 
             for i, path in enumerate(tqdm(impaths)):
-                
-                # Assume only one report per image
-                reports = [imcaps[i][0]]
-                
-                # Sanity check
-                assert len(reports) == reports_per_image
 
+                # Assume only one report per image
+                sentences = imcaps[i]
+                
                 # Read images
                 plan = dicom.read_file(impaths[i],stop_before_pixels=False)
                 img = np.uint8(plan.pixel_array/plan.pixel_array.max()*255)
@@ -211,23 +210,27 @@ def create_input_files(dataset, base_path, reports_per_image, min_word_freq, out
                 # Save image to HDF5 file
                 images[i] = img
 
-                for j, c in enumerate(reports):
-                    # Encode reports
+                enc_sentences = []
+                senlens = []
+                for j, c in enumerate(sentences):
+                    # Encode sentences
                     enc_c = [word_map['<start>']] + [word_map.get(word, word_map['<unk>']) for word in c] + [
                         word_map['<end>']] + [word_map['<pad>']] * (max_len - len(c))
 
                     # Find report lengths
                     c_len = len(c) + 2
 
-                    enc_reports.append(enc_c)
-                    replens.append(c_len)
+                    enc_sentences.append(enc_c)
+                    senlens.append(c_len)
+                total_enc_sentences.append(enc_sentences)
+                total_senlens.append(senlens)
 
             # Sanity check
-            assert images.shape[0] * reports_per_image == len(enc_reports) == len(replens)
+            assert images.shape[0] == len(total_enc_sentences) == len(total_senlens)
 
             # Save encoded reports and their lengths to JSON files
             with open(os.path.join(output_folder, split + '_REPORT_' + base_filename + '.json'), 'w') as j:
-                json.dump(enc_reports, j)
+                json.dump(total_enc_sentences, j)
 
-            with open(os.path.join(output_folder, split + '_REPLENS_' + base_filename + '.json'), 'w') as j:
-                json.dump(replens, j)
+            with open(os.path.join(output_folder, split + '_SENLENS_' + base_filename + '.json'), 'w') as j:
+                json.dump(total_senlens, j)
