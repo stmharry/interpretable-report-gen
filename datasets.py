@@ -24,16 +24,13 @@ class MimicDataset(Dataset):
         self.h = h5py.File(os.path.join(data_folder, self.split + '_IMAGES_' + data_name + '.hdf5'), 'r')
         self.imgs = self.h['images']
 
-        # Reports per image
-        self.rpi = self.h.attrs['reports_per_image']
-
         # Load encoded reports (completely into memory)
         with open(os.path.join(data_folder, self.split + '_REPORT_' + data_name + '.json'), 'r') as j:
             self.reports = json.load(j)
 
-        # Load report lengths (completely into memory)
-        with open(os.path.join(data_folder, self.split + '_REPLENS_' + data_name + '.json'), 'r') as j:
-            self.replens = json.load(j)
+        # Load sentences lengths (completely into memory)
+        with open(os.path.join(data_folder, self.split + '_SENLENS_' + data_name + '.json'), 'r') as j:
+            self.senlens = json.load(j)
 
         # PyTorch transformation pipeline for the image (normalizing, etc.)
         self.transform = transform
@@ -42,22 +39,18 @@ class MimicDataset(Dataset):
         self.dataset_size = len(self.reports)
 
     def __getitem__(self, i):
-        # Remember, the Nth report corresponds to the (N // reports_per_image)th image
-        img = torch.FloatTensor(self.imgs[i // self.rpi] / 255.)
+
+        img = torch.FloatTensor(self.imgs[i] / 255.)
         if self.transform is not None:
             img = self.transform(img)
 
+        # List of sentences in a report
         report = torch.LongTensor(self.reports[i])
 
-        replen = torch.LongTensor([self.replens[i]])
+        # List of sentences' length in a report
+        senlen = torch.LongTensor([self.senlens[i]])
 
-        if self.split is 'TRAIN':
-            return img, report, replen
-        else:
-            # For validation of testing, also return all 'reports_per_image' reports to find BLEU-4 score
-            all_reports = torch.LongTensor(
-                self.reports[((i // self.rpi) * self.rpi):(((i // self.rpi) * self.rpi) + self.rpi)])
-            return img, report, replen, all_reports
+        return img, report, senlen
 
     def __len__(self):
         return self.dataset_size
