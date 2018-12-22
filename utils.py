@@ -163,7 +163,7 @@ def create_input_files(dataset, base_path, min_word_freq, output_folder,
     assert len(test_image_paths) == len(test_image_sentences)
 
     # Create word map
-    words = [w for w in word_freq.keys() if word_freq[w] > min_word_freq]
+    words = [w for w in word_freq.keys() if word_freq[w] >= min_word_freq]
     word_map = {k: v + 1 for v, k in enumerate(words)}
     word_map['<unk>'] = len(word_map) + 1
     word_map['<start>'] = len(word_map) + 1
@@ -237,4 +237,4 @@ def create_input_files(dataset, base_path, min_word_freq, output_folder,
                 json.dump(total_senlens, j)
 
 if __name__ == "__main__":
-    create_input_files('mimiccxr','/crimea/mimic-cxr',5,'/crimea/liuguanx/mimic-output')
+    create_input_files('mimiccxr','/crimea/mimic-cxr',1,'/crimea/liuguanx/mimic-output')
