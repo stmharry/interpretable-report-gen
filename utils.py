@@ -236,7 +236,7 @@ def create_input_files(dataset, base_path, min_word_freq, output_folder,
             with open(os.path.join(output_folder, split + '_SENLENS_' + base_filename + '.json'), 'w') as j:
                 json.dump(total_senlens, j)
 
-def create_wordmap(min_word_freq, output_folder):
+def create_wordmap(min_word_freq, output_folder, stopword=False):
     mimic_cxr_map_path = '/crimea/mimic-cxr/mimic-cxr-map.csv'
     findings_path = '/data/medg/misc/interpretable-report-gen/data/reports-field-findings.tsv'
     dataframe = pd.read_table(findings_path)
