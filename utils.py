@@ -237,7 +237,7 @@ def create_input_files(dataset, base_path, min_word_freq, output_folder,
                 json.dump(total_senlens, j)
 
 def create_wordmap(min_word_freq, output_folder, stopword=False):
-    findings_path = '/data/medg/misc/interpretable-report-gen/data/reports-field-findings.tsv'
+    findings_path = '/data/medg/misc/interpretable-report-gen/cache/data/reports-field-findings.tsv'
     train_path = './data/train.csv'
 
     train_set = pd.read_csv(train_path)
