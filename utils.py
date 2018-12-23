@@ -236,5 +236,44 @@ def create_input_files(dataset, base_path, min_word_freq, output_folder,
             with open(os.path.join(output_folder, split + '_SENLENS_' + base_filename + '.json'), 'w') as j:
                 json.dump(total_senlens, j)
 
+def create_wordmap(min_word_freq, output_folder):
+    mimic_cxr_map_path = '/crimea/mimic-cxr/mimic-cxr-map.csv'
+    findings_path = '/data/medg/misc/interpretable-report-gen/data/reports-field-findings.tsv'
+    dataframe = pd.read_table(findings_path)
+    base_filename = 'mimiccxr_' + str(min_word_freq) + '_min_word_freq'
+
+    stop_words = stopwords.words('english')
+    my_new_stop_words = ['the','and','to','of','was','with','a','on','in','for','name',
+                 'is','patient','s','he','at','as','or','one','she','his','her','am',
+                 'were','you','pt','pm','by','be','had','your','this','date',
+                'from','there','an','that','p','are','have','has','h','but','o',
+                'namepattern','which','every','also','should','if','it','been','who','during', 'x']
+    stop_words.extend(my_new_stop_words)
+    stop_words = set(stop_words)
+    tokenizer = nltk.tokenize.punkt.PunktSentenceTokenizer()
+    word_freq = Counter()
+
+    for idx, row in dataframe.iterrows():
+        report = row['text']
+        sentences = tokenizer.tokenize(report)
+        for sentence in sentences:
+            tokens = word_tokenize(sentence)
+            if stopword:
+                filtered_tokens = [w for w in tokens if not w in stop_words]
+            else:
+                filtered_tokens = tokens
+            word_freq.update(filtered_tokens)
+            
+    words = [w for w in word_freq.keys() if word_freq[w] >= min_word_freq]
+    word_map = {k: v + 1 for v, k in enumerate(words)}
+    word_map['<unk>'] = len(word_map) + 1
+    word_map['<start>'] = len(word_map) + 1
+    word_map['<end>'] = len(word_map) + 1
+    word_map['<pad>'] = 0
+
+    with open(os.path.join(output_folder, 'WORDMAP_' + base_filename + '.json'), 'w') as j:
+        json.dump(word_map, j)
+
 if __name__ == "__main__":
-    create_input_files('mimiccxr','/crimea/mimic-cxr',1,'/crimea/liuguanx/mimic-output')
+    create_wordmap(1,'/crimea/liuguanx/mimic-output')
+    # create_input_files('mimiccxr','/crimea/mimic-cxr',1,'/crimea/liuguanx/mimic-output')
