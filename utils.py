@@ -236,9 +236,13 @@ def create_input_files(dataset, base_path, min_word_freq, output_folder,
             with open(os.path.join(output_folder, split + '_SENLENS_' + base_filename + '.json'), 'w') as j:
                 json.dump(total_senlens, j)
 
-def create_wordmap(min_word_freq, output_folder):
-    mimic_cxr_map_path = '/crimea/mimic-cxr/mimic-cxr-map.csv'
-    findings_path = '/data/medg/misc/interpretable-report-gen/data/reports-field-findings.tsv'
+def create_wordmap(min_word_freq, output_folder, stopword=False):
+    findings_path = '/data/medg/misc/interpretable-report-gen/cache/reports-field-findings.tsv'
+    train_path = './data/train.csv'
+
+    train_set = pd.read_csv(train_path)
+    rad_ids_list = list(train_set['rad_id'])
+
     dataframe = pd.read_table(findings_path)
     base_filename = 'mimiccxr_' + str(min_word_freq) + '_min_word_freq'
 
@@ -253,17 +257,18 @@ def create_wordmap(min_word_freq, output_folder):
     tokenizer = nltk.tokenize.punkt.PunktSentenceTokenizer()
     word_freq = Counter()
 
-    for idx, row in dataframe.iterrows():
-        report = row['text']
-        sentences = tokenizer.tokenize(report)
-        for sentence in sentences:
-            tokens = word_tokenize(sentence)
-            if stopword:
-                filtered_tokens = [w for w in tokens if not w in stop_words]
-            else:
-                filtered_tokens = tokens
-            word_freq.update(filtered_tokens)
-            
+    for idx, row in tqdm(dataframe.iterrows(), total=dataframe.shape[0]):
+        if row['rad_id'] in rad_ids_list:
+            report = row['text']
+            sentences = tokenizer.tokenize(report)
+            for sentence in sentences:
+                tokens = word_tokenize(sentence)
+                if stopword:
+                    filtered_tokens = [w for w in tokens if not w in stop_words]
+                else:
+                    filtered_tokens = tokens
+                word_freq.update(filtered_tokens)
+
     words = [w for w in word_freq.keys() if word_freq[w] >= min_word_freq]
     word_map = {k: v + 1 for v, k in enumerate(words)}
     word_map['<unk>'] = len(word_map) + 1
@@ -274,6 +279,30 @@ def create_wordmap(min_word_freq, output_folder):
     with open(os.path.join(output_folder, 'WORDMAP_' + base_filename + '.json'), 'w') as j:
         json.dump(word_map, j)
 
+def join_map():
+    mimic_cxr_map_path = '/crimea/mimic-cxr/mimic-cxr-map.csv'
+    train_sub_ids_path = './data/train_subject_ids.csv'
+    test_sub_ids_path = './data/test_subject_ids.csv'
+    report_findings_path = '/data/medg/misc/interpretable-report-gen/cache/reports-field-findings.tsv'
+
+    cxr_map = pd.read_csv(mimic_cxr_map_path)
+    train_sub_ids = pd.read_csv(train_sub_ids_path)
+    test_sub_ids = pd.read_csv(test_sub_ids_path)
+    report_findings = pd.read_table(report_findings_path)
+
+    train_info = cxr_map.merge(train_sub_ids,left_on='subject_id',right_on='sub_id',how='inner')
+    new_train_info = train_info[['subject_id','rad_id','dicom_id']]
+    new_train_info.to_csv('./data/train.csv')
+
+    test_info = cxr_map.merge(test_sub_ids,left_on='subject_id',right_on='sub_id',how='inner')
+    new_test_info = test_info[['subject_id','rad_id','dicom_id']]
+    new_test_info.to_csv('./data/test.csv')
+
+    report_info = report_findings.merge(cxr_map,left_on='rad_id',right_on='rad_id',how='inner')
+    new_report_info = report_info[['subject_id','rad_id','dicom_id','text']]
+    new_report_info.to_csv('/crimea/liuguanx/mimic-output/new_map_with_report.csv')
+
 if __name__ == "__main__":
-    create_wordmap(1,'/crimea/liuguanx/mimic-output')
+    join_map()
+    # create_wordmap(1,'/crimea/liuguanx/mimic-output')
     # create_input_files('mimiccxr','/crimea/mimic-cxr',1,'/crimea/liuguanx/mimic-output')
