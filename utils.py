@@ -278,6 +278,30 @@ def create_wordmap(min_word_freq, output_folder, stopword=False):
     with open(os.path.join(output_folder, 'WORDMAP_' + base_filename + '.json'), 'w') as j:
         json.dump(word_map, j)
 
+def join_map():
+    mimic_cxr_map_path = '/crimea/mimic-cxr/mimic-cxr-map.csv'
+    train_sub_ids_path = './data/train_subject_ids.csv'
+    test_sub_ids_path = './data/test_subject_ids.csv'
+    report_findings_path = '/data/medg/misc/interpretable-report-gen/cache/reports-field-findings.tsv'
+
+    cxr_map = pd.read_csv(mimic_cxr_map_path)
+    train_sub_ids = pd.read_csv(train_sub_ids)
+    test_sub_ids = pd.read_csv(test_sub_ids_path)
+    report_findings = pd.read_table(report_findings_path)
+
+    train_info = cxr_map.merge(train_sub_ids,left_on='subject_id',right_on='sub_id',how='inner')
+    new_train_info = train_info[['subject_id','rad_id','dicom_id']]
+    new_train_info.to_csv('./data/train.csv')
+
+    test_info = cxr_map.merge(test_sub_ids,left_on='subject_id',right_on='sub_id',how='inner')
+    new_test_info = test_info[['subject_id','rad_id','dicom_id']]
+    new_test_info.to_csv('./data/test.csv')
+
+    report_info = report_findings.merge(cxr_map,left_on='rad_id',right_on='rad_id',how='inner')
+    new_report_info = report_info[['subject_id','rad_id','dicom_id','text']]
+    new_report_info.to_csv('/crimea/liuguanx/mimic-output/new_map_with_report.csv')
+
 if __name__ == "__main__":
-    create_wordmap(1,'/crimea/liuguanx/mimic-output')
+    join_map()
+    # create_wordmap(1,'/crimea/liuguanx/mimic-output')
     # create_input_files('mimiccxr','/crimea/mimic-cxr',1,'/crimea/liuguanx/mimic-output')
