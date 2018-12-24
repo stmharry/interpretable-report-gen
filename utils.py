@@ -285,7 +285,7 @@ def join_map():
     report_findings_path = '/data/medg/misc/interpretable-report-gen/cache/reports-field-findings.tsv'
 
     cxr_map = pd.read_csv(mimic_cxr_map_path)
-    train_sub_ids = pd.read_csv(train_sub_ids)
+    train_sub_ids = pd.read_csv(train_sub_ids_path)
     test_sub_ids = pd.read_csv(test_sub_ids_path)
     report_findings = pd.read_table(report_findings_path)
 
