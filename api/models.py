@@ -1,3 +1,4 @@
+import logging
 import torch
 import torch.nn.functional as F
 
@@ -15,6 +16,8 @@ from torchvision.models.resnet import (
     ResNet,
     Bottleneck,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class AdaptiveAttention(Module):
@@ -138,9 +141,12 @@ class ReportDecoder(Module):
 
         """
 
-        (lengths, indices) = lengths.sort(0, descending=True)
+        indices = lengths.argsort(descending=True)
+        _indices = indices.argsort()
+
         v = v[indices]
         l = l[indices]
+        lengths = lengths[indices]
 
         vg = v.mean(1)
 
@@ -149,12 +155,16 @@ class ReportDecoder(Module):
 
         outputs = []
         for t in range(max(lengths)):
+            logger.debug(f'ReportDecoder.forward(): time_step={t}')
             batch_size_t = sum(lengths > t)
 
-            x = torch.cat([vg.expand(batch_size_t, -1), l[:batch_size_t, t]], 1)
+            x = torch.cat([vg[:batch_size_t], l[:batch_size_t, t]], 1)
+            h = h[:batch_size_t]
+            m = m[:batch_size_t]
+
             (h, m) = self.lstm_cell(x, (h, m))
             (label, topic, temp, stop) = F.relu(self.fc(self.dropout(h))).split(self.fc_sizes, 1)
-            # TODO: label, topic
+            # TODO(stmharry): process label, topic
             temp = torch.exp(temp)
             stop = torch.sigmoid(stop)
 
@@ -162,7 +172,12 @@ class ReportDecoder(Module):
 
         (label, topic, temp, stop) = [torch.nn.utils.rnn.pad_sequence(output) for output in zip(*outputs)]
 
-        return (label, topic, temp, stop)
+        return (
+            label[_indices],
+            topic[_indices],
+            temp[_indices],
+            stop[_indices],
+        )
 
 
 class SetenceDecoder(Module):
@@ -203,11 +218,14 @@ class SetenceDecoder(Module):
 
         max_length = max(lengths)
 
-        (lengths, indices) = lengths.sort(0, descending=True)
+        indices = lengths.argsort(descending=True)
+        _indices = indices.argsort()
+
         v = v[indices]
         w = w[indices]
+        lengths = lengths[indices]
 
-        w = self.word_embedding(w)
+        w = self.word_embedding(self.dropout(w))
         vg = v.mean(1)
 
         h = torch.tanh(self.fc_h(self.dropout(vg)))
@@ -226,41 +244,7 @@ class SetenceDecoder(Module):
 
         (attention, prob) = [torch.nn.utils.rnn.pad_sequence(output) for output in zip(*outputs)]
 
-        return (attention, prob)
-
-
-if __name__ == '__main__':
-
-    image_size = 8
-    label_size = 16
-    embedding_size = 256
-    hidden_size = 256
-    vocab_size = 1337
-
-    device = torch.device('cuda')
-
-    image_encoder = ImageEncoder(
-        image_size=image_size,
-        embedding_size=embedding_size,
-    ).to(device)
-    report_decoder = ReportDecoder(
-        label_size=label_size,
-        embedding_size=embedding_size,
-        hidden_size=hidden_size,
-    ).to(device)
-    sentence_decoder = SetenceDecoder(
-        vocab_size=vocab_size,
-        image_size=image_size,
-        image_embedding_size=image_encoder.image_embedding_size,
-        embedding_size=embedding_size,
-        hidden_size=hidden_size,
-    ).to(device)
-
-    v = torch.zeros((16, 1, 256, 256)).to(device)
-    l = torch.zeros((16, 32, 16)).to(device)
-    w = torch.zeros((16, 32), dtype=torch.long).to(device)
-    lengths = torch.full((16,), 32, dtype=torch.long).to(device)
-
-    v = image_encoder(v)
-    (label, topic, temp, stop) = report_decoder(v, l, lengths)
-    # (a, p) = sentence_decoder(v, w, lengths)
+        return (
+            attention[_indices],
+            prob[_indices],
+        )
