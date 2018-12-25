@@ -83,7 +83,7 @@ def parse_report(path):
         paragraph = report[start:end]
         paragraph = mimic_re.sub(r'\s{2,}', ' ', paragraph)
         paragraph = paragraph.strip()
-        
+
         parsed_report[title] = paragraph
 
     return parsed_report
@@ -138,7 +138,7 @@ def create_input_files(dataset, base_path, min_word_freq, output_folder,
     # Read mimic-cxr-map file
     data = pd.read_csv(os.path.join(base_path, 'mimic-cxr-map.csv'), sep=',', header=0)
     data = data.loc[data['dicom_is_available'],:]
-    
+
     # Split data into three set
     data['random'] = np.random.uniform(0.0,1.0,len(data))
     train = data[data['random'] < 0.7]
@@ -196,7 +196,7 @@ def create_input_files(dataset, base_path, min_word_freq, output_folder,
 
                 # Assume only one report per image
                 sentences = imcaps[i]
-                
+
                 # Read images
                 plan = dicom.read_file(impaths[i],stop_before_pixels=False)
                 img = np.uint8(plan.pixel_array/plan.pixel_array.max()*255)
