@@ -17,6 +17,8 @@ from torchvision.models.resnet import (
     Bottleneck,
 )
 
+from api.utils import length_sorted
+
 logger = logging.getLogger(__name__)
 
 
@@ -119,70 +121,60 @@ class ReportDecoder(Module):
 
         self.fc_h = Linear(embedding_size, hidden_size)
         self.fc_m = Linear(embedding_size, hidden_size)
-        # (label, topic, temp, stop)
-        self.fc_sizes = [self.label_size, self.hidden_size, 1, 1]
+        self.fc_sizes = [self.label_size, self.hidden_size, 1, 1]  # (label, topic, temp, stop)
         self.fc = Linear(hidden_size, sum(self.fc_sizes))
         self.lstm_cell = LSTMCell(embedding_size + label_size, hidden_size)
         self.dropout = Dropout(0.5)
 
-    def forward(self, v, l, lengths):
+    @length_sorted
+    def forward(self, image, label, length):
         """
 
         Args:
-            v (batch_size, image_size * image_size, hidden_size): Image feature map.
-            l (batch_size, max_length, label_size): Interpretable labels.
-            lengths (batch_size,): Sequence lengths.
+            image (batch_size, image_size * image_size, hidden_size): Image feature map.
+            label (batch_size, max_length, label_size): Interpretable labels.
+            length (batch_size,): Sequence lengths.
 
         Returns:
-            label (batch_size, max_length, label_size): Generated labels.
-            topic (batch_size, max_length, embedding_size): Generated topic embeddings.
-            temp (batch_size, max_length, 1): Temperatures.
-            stop (batch_size, max_length, 1): Stop decoding.
+            _label (batch_size, max_length, label_size): Generated labels.
+            _topic (batch_size, max_length, embedding_size): Generated topic embeddings.
+            _temp (batch_size, max_length, 1): Temperatures.
+            _stop (batch_size, max_length, 1): Stop decoding.
 
         """
 
-        indices = lengths.argsort(descending=True)
-        _indices = indices.argsort()
+        image_mean = image.mean(1)
 
-        v = v[indices]
-        l = l[indices]
-        lengths = lengths[indices]
-
-        vg = v.mean(1)
-
-        h = torch.tanh(self.fc_h(self.dropout(vg)))
-        m = torch.tanh(self.fc_m(self.dropout(vg)))
+        h = torch.tanh(self.fc_h(self.dropout(image_mean)))
+        m = torch.tanh(self.fc_m(self.dropout(image_mean)))
 
         outputs = []
-        for t in range(max(lengths)):
+        for t in range(max(length)):
             logger.debug(f'ReportDecoder.forward(): time_step={t}')
-            batch_size_t = sum(lengths > t)
+            batch_size_t = sum(length > t)
 
-            x = torch.cat([vg[:batch_size_t], l[:batch_size_t, t]], 1)
+            x = torch.cat([
+                self.dropout(image_mean[:batch_size_t]),
+                label[:batch_size_t, t],
+            ], 1)
             h = h[:batch_size_t]
             m = m[:batch_size_t]
 
             (h, m) = self.lstm_cell(x, (h, m))
-            (label, topic, temp, stop) = F.relu(self.fc(self.dropout(h))).split(self.fc_sizes, 1)
+            (_label, _topic, _temp, _stop) = F.relu(self.fc(self.dropout(h))).split(self.fc_sizes, 1)
             # TODO(stmharry): process label, topic
-            temp = torch.exp(temp)
-            stop = torch.sigmoid(stop)
+            _temp = torch.exp(_temp)
+            _stop = torch.sigmoid(_stop)
 
-            outputs.append((label, topic, temp, stop))
+            outputs.append((_label, _topic, _temp, _stop))
 
-        (label, topic, temp, stop) = [torch.nn.utils.rnn.pad_sequence(output) for output in zip(*outputs)]
-
-        return (
-            label[_indices],
-            topic[_indices],
-            temp[_indices],
-            stop[_indices],
-        )
+        return [torch.nn.utils.rnn.pad_sequence(output) for output in zip(*outputs)]
 
 
 class SetenceDecoder(Module):
     def __init__(self,
                  vocab_size,
+                 label_size,
                  image_size,
                  image_embedding_size,
                  embedding_size,
@@ -193,58 +185,59 @@ class SetenceDecoder(Module):
         self.word_embedding = Embedding(vocab_size, embedding_size)
         self.fc_h = Linear(embedding_size, hidden_size)
         self.fc_m = Linear(embedding_size, hidden_size)
-        self.lstm_cell = LSTMCell(2 * embedding_size, hidden_size)
+        self.lstm_sizes = [embedding_size, label_size, embedding_size, embedding_size]  # (image, label, topic, text)
+        self.lstm_cell = LSTMCell(sum(self.lstm_sizes), hidden_size)
         self.adaptive_attention = AdaptiveAttention(image_size, hidden_size)
         self.fc_p = Linear(hidden_size, vocab_size)
         self.dropout = Dropout(0.5)
 
         self.vocab_size = vocab_size
+        self.label_size = label_size
         self.embedding_size = embedding_size
         self.hidden_size = hidden_size
 
-    def forward(self, v, w, lengths):
+    @length_sorted
+    def forward(self, image, text, label, topic, temp, length):
         """
 
         Args:
-            v (batch_size, image_size * image_size, hidden_size): Image feature map.
-            w (batch_size, max_length): Sentences.
-            lengths (batch_size,): Sequence lengths.
+            image (batch_size, image_size * image_size, hidden_size): Image feature map.
+            text (batch_size, max_length): Sentences.
+            label (batch_size, label_size): Interpretable labels.
+            topic (batch_size, embedding_size): Topic embeddings.
+            temp (batch_size, 1): Temperature parameters.
+            length (batch_size,): Sequence lengths.
 
         Returns:
-            attention (batch_size, max_length, image_size * image_size + 1): Attention weights.
-            prob (batch_size, max_length, vocab_size): Generated probability on words.
+            _attention (batch_size, max_length, image_size * image_size + 1): Attention weights.
+            _probability (batch_size, max_length, vocab_size): Generated probability on words.
 
         """
 
-        max_length = max(lengths)
+        text = self.word_embedding(text)
+        image_mean = image.mean(1)
 
-        indices = lengths.argsort(descending=True)
-        _indices = indices.argsort()
-
-        v = v[indices]
-        w = w[indices]
-        lengths = lengths[indices]
-
-        w = self.word_embedding(self.dropout(w))
-        vg = v.mean(1)
-
-        h = torch.tanh(self.fc_h(self.dropout(vg)))
-        m = torch.tanh(self.fc_m(self.dropout(vg)))
+        h = torch.tanh(self.fc_h(self.dropout(image_mean)))
+        m = torch.tanh(self.fc_m(self.dropout(image_mean)))
 
         outputs = []
-        for t in range(max_length):
-            batch_size_t = sum(lengths > t)
+        for t in range(max(length)):
+            logger.debug(f'SentenceDecoder.forward(): time_step={t}')
+            batch_size_t = sum(length > t)
 
-            x = torch.cat([vg.expand(batch_size_t, -1), w[:batch_size_t, t]], 1)
+            x = torch.cat([
+                self.dropout(image_mean[:batch_size_t]),
+                label[:batch_size_t],
+                self.dropout(topic[:batch_size_t]),
+                self.dropout(text[:batch_size_t, t]),
+            ], 1)
+            h = h[:batch_size_t]
+            m = m[:batch_size_t]
+
             (h, m) = self.lstm_cell(x, (h, m))
-            (a, c) = self.adaptive_attention(v, h)
-            p = F.softmax(self.fc_p(self.dropout(c + h)), 1)
+            (_attention, c) = self.adaptive_attention(image[:batch_size_t], h)
+            _probability = F.softmax(self.fc_p(self.dropout(c + h)), 1) / temp[:batch_size_t]
 
-            outputs.append((a, p))
+            outputs.append((_attention, _probability))
 
-        (attention, prob) = [torch.nn.utils.rnn.pad_sequence(output) for output in zip(*outputs)]
-
-        return (
-            attention[_indices],
-            prob[_indices],
-        )
+        return [torch.nn.utils.rnn.pad_sequence(output) for output in zip(*outputs)]

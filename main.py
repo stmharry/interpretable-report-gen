@@ -16,6 +16,7 @@ from mimic_cxr.data import MIMIC_CXR
 from api.datasets import Dataset
 from api.data_loader import CollateFn
 from api.models import ImageEncoder, ReportDecoder, SetenceDecoder
+from api.utils import expand_to_sequence, join_sequence
 
 ### Global
 flags.DEFINE_string('do', 'main', 'Function to execute (default: "main")')
@@ -38,8 +39,8 @@ flags.DEFINE_integer('batch_size', 4, 'Batch size')
 FLAGS = flags.FLAGS
 
 ### __TEMP__
-label_size = 16
 vocab_size = 1337
+label_size = 16
 
 
 def main():
@@ -89,6 +90,7 @@ def main():
     ).to(device)
     sentence_decoder = SetenceDecoder(
         vocab_size=vocab_size,
+        label_size=label_size,
         image_size=FLAGS.image_size,
         image_embedding_size=image_encoder.image_embedding_size,
         embedding_size=FLAGS.embedding_size,
@@ -113,9 +115,27 @@ def main():
         'sent_length',
     ]]
 
-    image = image_encoder(image)
-    (_label, topic, temp, stop) = report_decoder(image, label, text_length)
+    # TODO(stmharry): pass in view_position
 
+    image = image_encoder(image)
+    (_label, _topic, _temp, _stop) = report_decoder(image, label, length=text_length)
+
+    # TODO(stmharry): report level loss here
+
+    image = expand_to_sequence(image, max(text_length))
+    image = join_sequence(image, text_length)
+
+    text = join_sequence(text, text_length)
+    label = join_sequence(label, text_length)
+    sent_length = join_sequence(sent_length, text_length)
+
+    _topic = join_sequence(_topic, text_length)
+    _temp = join_sequence(_temp, text_length)
+    _stop = join_sequence(_stop, text_length)
+
+    (_attention, _probability) = sentence_decoder(image, text, label, _topic, _temp, length=sent_length)
+
+    # TODO(stmharry): sentence level loss here
 
     import pdb; pdb.set_trace()
 
