@@ -84,7 +84,7 @@ class Dataset(torch.utils.data.Dataset):
         sent_length = torch.as_tensor(sent_length, dtype=torch.long)
         text_length = torch.as_tensor(sent_length.numel(), dtype=torch.long)
 
-        # TODO(stmharry): load label
+        # TODO(stmharry): load label, remember bos/eos!
         label = torch.ones((text_length, 16), dtype=torch.float)
 
         return {
