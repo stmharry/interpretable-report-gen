@@ -1,15 +1,19 @@
+import tensorboardX
 import torch
 
 
-def expand_to_sequence(tensor, length):
-    return torch.stack([tensor] * int(length), 1)
+def unpad_sequence(tensor, lengths, is_sequence=True):
+    if not is_sequence:
+        tensor = torch.stack([tensor] * int(lengths.max()), 1)
 
-
-def join_sequence(tensor, lengths):
     sequences = tensor.unbind(0)
     sequences = [sequence[:length] for (sequence, length) in zip(sequences, lengths)]
 
-    return torch.cat(sequences, 0)
+    return sequences
+
+
+def teacher_sequence(tensor):
+    return tensor[:, 1:]
 
 
 def length_sorted(func):
