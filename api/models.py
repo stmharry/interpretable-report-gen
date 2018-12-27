@@ -67,15 +67,15 @@ class AdaptiveAttention(Module):
 class ImageEncoder(ResNet):
     image_embedding_size = 2048
 
-    def __init__(self, image_size, embedding_size):
+    def __init__(self, **kwargs):
         super(ImageEncoder, self).__init__(Bottleneck, [3, 4, 6, 3])
 
-        self.image_size = image_size
-        self.embedding_size = embedding_size
+        self.image_size = kwargs['image_size']
+        self.embedding_size = kwargs['embedding_size']
 
         self.conv1 = Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.avgpool = AdaptiveAvgPool2d((image_size, image_size))
-        self.fc = Conv2d(self.image_embedding_size, embedding_size, (1, 1))
+        self.avgpool = AdaptiveAvgPool2d((self.image_size, self.image_size))
+        self.fc = Conv2d(self.image_embedding_size, self.embedding_size, (1, 1))
         self.dropout = Dropout(0.5)
 
     def forward(self, v):
@@ -108,38 +108,52 @@ class ImageEncoder(ResNet):
 
 
 class ReportDecoder(Module):
-    def __init__(self,
-                 label_size,
-                 embedding_size,
-                 hidden_size):
-
+    def __init__(self, **kwargs):
         super(ReportDecoder, self).__init__()
 
-        self.label_size = label_size
-        self.embedding_size = embedding_size
-        self.hidden_size = hidden_size
+        self.view_position_size = kwargs['view_position_size']
+        self.label_size = kwargs['label_size']
+        self.embedding_size = kwargs['embedding_size']
+        self.hidden_size = kwargs['hidden_size']
 
-        self.fc_h = Linear(embedding_size, hidden_size)
-        self.fc_m = Linear(embedding_size, hidden_size)
-        self.fc_sizes = [self.label_size, self.hidden_size, 1, 1]  # (label, topic, temp, stop)
-        self.fc = Linear(hidden_size, sum(self.fc_sizes))
-        self.lstm_cell = LSTMCell(embedding_size + label_size, hidden_size)
+        self.fc_h = Linear(self.embedding_size, self.hidden_size)
+        self.fc_m = Linear(self.embedding_size, self.hidden_size)
+        self.fc_sizes = [
+            self.label_size,  # label
+            self.hidden_size,  # topic
+            1,  # stop
+            1,  # temp
+        ]
+        self.fc = Linear(self.hidden_size, sum(self.fc_sizes))
+        self.lstm_sizes = [
+            self.embedding_size,  # image
+            self.view_position_size,  # view_position
+            1,  # begin
+            self.label_size,  # label
+        ]
+        self.lstm_cell = LSTMCell(sum(self.lstm_sizes), self.hidden_size)
         self.dropout = Dropout(0.5)
 
     @length_sorted
-    def forward(self, image, label, length):
+    def forward(self,
+                image,
+                view_position,
+                label,
+                length):
+
         """
 
         Args:
             image (batch_size, image_size * image_size, hidden_size): Image feature map.
-            label (batch_size, max_length, label_size): Interpretable labels.
+            view_position (batch_size, view_position_size): Patient positions.
+            label (batch_size, max_length + 1, label_size): Interpretable labels.
             length (batch_size,): Sequence lengths.
 
         Returns:
             _label (batch_size, max_length, label_size): Generated labels.
             _topic (batch_size, max_length, embedding_size): Generated topic embeddings.
+            _stop (batch_size, max_length, 1): Stop signal.
             _temp (batch_size, max_length, 1): Temperatures.
-            _stop (batch_size, max_length, 1): Stop decoding.
 
         """
 
@@ -149,59 +163,74 @@ class ReportDecoder(Module):
         m = torch.tanh(self.fc_m(self.dropout(image_mean)))
 
         outputs = []
-        for t in range(max(length)):
+        for t in range(max(length - 1)):
             logger.debug(f'ReportDecoder.forward(): time_step={t}')
-            batch_size_t = sum(length > t)
+            batch_size_t = sum(length - 1 > t)
 
+            begin = torch.ones((batch_size_t, 1), dtype=torch.float, device=label.device) * (t == 0)
             x = torch.cat([
                 self.dropout(image_mean[:batch_size_t]),
+                view_position[:batch_size_t],
+                begin,
                 label[:batch_size_t, t],
             ], 1)
             h = h[:batch_size_t]
             m = m[:batch_size_t]
 
             (h, m) = self.lstm_cell(x, (h, m))
-            (_label, _topic, _temp, _stop) = F.relu(self.fc(self.dropout(h))).split(self.fc_sizes, 1)
-            # TODO(stmharry): process label, topic
-            _temp = torch.exp(_temp)
+            (_label, _topic, _stop, _temp) = self.fc(self.dropout(h)).split(self.fc_sizes, 1)
+            # TODO(stmharry): on label apply softmax group
+            _topic = F.relu(_topic)
             _stop = torch.sigmoid(_stop)
+            _temp = torch.exp(_temp)
 
-            outputs.append((_label, _topic, _temp, _stop))
+            outputs.append((_label, _topic, _stop, _temp))
 
         return [torch.nn.utils.rnn.pad_sequence(output) for output in zip(*outputs)]
 
 
-class SetenceDecoder(Module):
-    def __init__(self,
-                 vocab_size,
-                 label_size,
-                 image_size,
-                 image_embedding_size,
-                 embedding_size,
-                 hidden_size):
+class SentenceDecoder(Module):
+    def __init__(self, **kwargs):
+        super(SentenceDecoder, self).__init__()
 
-        super(SetenceDecoder, self).__init__()
+        self.image_size = kwargs['image_size']
+        self.view_position_size = kwargs['view_position_size']
+        self.vocab_size = kwargs['vocab_size']
+        self.label_size = kwargs['label_size']
+        self.embedding_size = kwargs['embedding_size']
+        self.hidden_size = kwargs['hidden_size']
 
-        self.word_embedding = Embedding(vocab_size, embedding_size)
-        self.fc_h = Linear(embedding_size, hidden_size)
-        self.fc_m = Linear(embedding_size, hidden_size)
-        self.lstm_sizes = [embedding_size, label_size, embedding_size, embedding_size]  # (image, label, topic, text)
-        self.lstm_cell = LSTMCell(sum(self.lstm_sizes), hidden_size)
-        self.adaptive_attention = AdaptiveAttention(image_size, hidden_size)
-        self.fc_p = Linear(hidden_size, vocab_size)
+        self.word_embedding = Embedding(self.vocab_size, self.embedding_size)
+        self.fc_h = Linear(self.embedding_size, self.hidden_size)
+        self.fc_m = Linear(self.embedding_size, self.hidden_size)
+        self.lstm_sizes = [
+            self.embedding_size,  # image
+            self.view_position_size,  # view_position
+            self.label_size,  # label
+            self.embedding_size,  # topic
+            self.embedding_size,  # text
+        ]
+        self.lstm_cell = LSTMCell(sum(self.lstm_sizes), self.hidden_size)
+        self.adaptive_attention = AdaptiveAttention(self.image_size, self.hidden_size)
+        self.fc_p = Linear(self.hidden_size, self.vocab_size)
         self.dropout = Dropout(0.5)
 
-        self.vocab_size = vocab_size
-        self.label_size = label_size
-        self.embedding_size = embedding_size
-        self.hidden_size = hidden_size
 
     @length_sorted
-    def forward(self, image, text, label, topic, temp, length):
+    def forward(self,
+                image,
+                view_position,
+                text,
+                label,
+                topic,
+                temp,
+                length):
+
         """
 
         Args:
             image (batch_size, image_size * image_size, hidden_size): Image feature map.
+            view_position (batch_size, view_position_size): Patient positions.
             text (batch_size, max_length): Sentences.
             label (batch_size, label_size): Interpretable labels.
             topic (batch_size, embedding_size): Topic embeddings.
@@ -210,7 +239,7 @@ class SetenceDecoder(Module):
 
         Returns:
             _attention (batch_size, max_length, image_size * image_size + 1): Attention weights.
-            _probability (batch_size, max_length, vocab_size): Generated probability on words.
+            _log_probability (batch_size, max_length, vocab_size): Generated probability on words.
 
         """
 
@@ -221,12 +250,13 @@ class SetenceDecoder(Module):
         m = torch.tanh(self.fc_m(self.dropout(image_mean)))
 
         outputs = []
-        for t in range(max(length)):
+        for t in range(max(length - 1)):
             logger.debug(f'SentenceDecoder.forward(): time_step={t}')
-            batch_size_t = sum(length > t)
+            batch_size_t = sum(length - 1 > t)
 
             x = torch.cat([
                 self.dropout(image_mean[:batch_size_t]),
+                view_position[:batch_size_t],
                 label[:batch_size_t],
                 self.dropout(topic[:batch_size_t]),
                 self.dropout(text[:batch_size_t, t]),
@@ -236,8 +266,8 @@ class SetenceDecoder(Module):
 
             (h, m) = self.lstm_cell(x, (h, m))
             (_attention, c) = self.adaptive_attention(image[:batch_size_t], h)
-            _probability = F.softmax(self.fc_p(self.dropout(c + h)), 1) / temp[:batch_size_t]
+            _log_probability = F.log_softmax(self.fc_p(self.dropout(c + h)), 1) / temp[:batch_size_t]
 
-            outputs.append((_attention, _probability))
+            outputs.append((_attention, _log_probability))
 
         return [torch.nn.utils.rnn.pad_sequence(output) for output in zip(*outputs)]
