@@ -1,5 +1,6 @@
 import datetime
 import functools
+import json
 import logging
 import nltk
 import numpy as np
@@ -12,7 +13,7 @@ import tqdm
 import warnings
 
 from absl import flags
-from torch.nn import Module, functional as F
+from torch.nn import Module, DataParallel, functional as F
 
 from mimic_cxr.data import MIMIC_CXR
 from mimic_cxr.utils import (
@@ -21,10 +22,10 @@ from mimic_cxr.utils import (
 )
 
 from api import Phase
-from api.datasets import Dataset as _Dataset
+from api.datasets import MimicCXRDataset
 from api.data_loader import CollateFn
 from api.models import ImageEncoder, ReportDecoder, SentenceDecoder
-from api.utils import unpad_sequence, teacher_sequence
+from api.utils import expand_to_sequence, unpad_sequence, teacher_sequence, print_batch
 
 
 ### Global
@@ -37,6 +38,7 @@ flags.DEFINE_integer('image_size', 8, 'Image feature map size (default: 8)')
 
 ### Text
 flags.DEFINE_string('field', 'findings', 'The field to use in text reports (default: "findings")')
+flags.DEFINE_integer('min_word_freq', 5, 'Minimum frequency of words in vocabulary (default: 5)')
 flags.DEFINE_integer('max_report_length', 16, 'Maximum number of sentences in a report (default: 16)')
 flags.DEFINE_integer('max_sentence_length', 64, 'Maximum number of words in a sentence (default: 64)')
 
@@ -44,7 +46,7 @@ flags.DEFINE_integer('max_sentence_length', 64, 'Maximum number of words in a se
 flags.DEFINE_integer('embedding_size', 256, 'Embedding size before feeding into the RNN (default: 256)')
 flags.DEFINE_integer('hidden_size', 256, 'Hidden size in the RNN (default: 256)')
 flags.DEFINE_integer('num_workers', 8, 'Number of data loading workers (default: 8)')
-flags.DEFINE_integer('batch_size', 4, 'Batch size (default: 4)')
+flags.DEFINE_integer('batch_size', 16, 'Batch size (default: 16)')
 flags.DEFINE_integer('num_epochs', 16, 'Number of training epochs (default: 16)')
 flags.DEFINE_float('lr', None, 'Learning rate')
 flags.DEFINE_string('working_dir', os.getenv('WORKING_DIR'), 'Working directory (default: $WORKING_DIR)')
@@ -59,83 +61,76 @@ class Model(Module):
         self.report_decoder = ReportDecoder(**kwargs)
         self.sentence_decoder = SentenceDecoder(**kwargs)
 
-        self.optimizer = kwargs['optim_cls'](
-            self.parameters(),
-            lr=FLAGS.lr,
-        )
-
     def forward(self, batch):
-        (image, view_position, text_length, text, label, stop, sent_length) = [
-            batch[key]
-            for key in ['image', 'view_position', 'text_length', 'text', 'label', 'stop', 'sent_length']
-        ]
+        # image, view_position, text_length, text, label, stop, sent_length
 
         losses = {}
         metrics = {}
 
-        image = self.image_encoder(image)
+        ### Image
+        batch.update(self.image_encoder(batch))  # image
 
         ### Forwarding for Report Level
-        (_label, _topic, _stop, _temp) = self.report_decoder(image, view_position, label, length=text_length)
+        batch.update(self.report_decoder(batch, length=batch['text_length']))  # _label, _topic, _stop, _temp
 
         ### Teacher-forcing for Report Level
-        (text, label, stop, sent_length) = [
-            teacher_sequence(value)
-            for value in [text, label, stop, sent_length]
-        ]
+        for key in ['text', 'label', 'stop', 'sent_length']:
+            batch[key] = teacher_sequence(batch[key])
 
         ### Convert to Sentence Level
-        (image, view_position) = [
-            torch.cat(unpad_sequence(value, text_length - 1, is_sequence=False), 0)
-            for value in [image, view_position]
-        ]
-        (text, label, stop, sent_length, _label, _topic, _stop, _temp) = [
-            torch.cat(unpad_sequence(value, text_length - 1, is_sequence=True), 0)
-            for value in [text, label, stop, sent_length, _label, _topic, _stop, _temp]
-        ]
+        for key in ['image', 'view_position']:
+            batch[key] = expand_to_sequence(batch[key], torch.max(batch['text_length'] - 1))
 
-        losses['end_ce'] = F.binary_cross_entropy(_stop, stop)
+        for key in ['image', 'view_position', 'text', 'label', 'stop', 'sent_length', '_label', '_topic', '_stop', '_temp']:
+            batch[key] = torch.cat(unpad_sequence(batch[key], batch['text_length'] - 1), 0)
 
         ### Forwarding for Sentence Level
-        (_attention, _log_probability) = self.sentence_decoder(image, view_position, text, label, _topic, _temp, length=sent_length)
+        batch.update(self.sentence_decoder(batch, length=batch['sent_length']))  # _attention, _log_probability
 
         ### Teacher-forcing for Sentence Level
-        text = teacher_sequence(text)
+        for key in ['text']:
+            batch[key] = teacher_sequence(batch[key])
 
         ### Convert to Word Level
-        (text, _log_probability) = [
-            torch.cat(unpad_sequence(value, sent_length - 1, is_sequence=True), 0)
-            for value in [text, _log_probability]
-        ]
+        for key in ['text', '_attention', '_log_probability']:
+            batch[key] = torch.cat(unpad_sequence(batch[key], batch['sent_length'] - 1), 0)
 
-        losses['word_ce'] = F.nll_loss(_log_probability, text)
+        return batch
 
-        import pdb; pdb.set_trace()
 
-        return {
-            'topic': _topic,
-            'temp': _temp,
-            'attention': _attention,
-            'log_probability': _log_probability,
-            'losses': losses,
-            'metrics': metrics,
-        }
-
-    def decode(self):
-        pass
+class Net(object):
+    def __init__(self, model):
+        self.model = model
+        self.optimizer = torch.optim.RMSprop(
+            self.model.parameters(),
+            lr=FLAGS.lr,
+        )
 
     def pre_epoch(self, phase):
         self.phase = phase
 
-    def pre_batch(self):
+        if phase == Phase.train:
+            self.model.train()
+        elif phase == Phase.test:
+            self.model.eval()
+
+    def pre_batch(self, num_step):
         self.num_step = num_step
 
         if self.phase == Phase.train:
-            self.train()
             self.optimizer.zero_grad()
 
-    def step(self, batch):
-        batch = self.forward(batch)
+    def step_batch(self, batch):
+        batch = self.model.forward(batch)
+
+        batch['losses'] = {
+            'stop_bce': F.binary_cross_entropy(batch['_stop'], batch['stop']),
+            'word_ce': F.nll_loss(batch['_log_probability'], batch['text']),
+        }
+
+        batch['metrics'] = {
+            'word_perplexity': torch.exp(batch['losses']['word_ce']),
+        }
 
         if self.phase == Phase.train:
             total_loss = sum(batch['losses'].values())
@@ -166,11 +161,10 @@ def main():
     train_df = df[df.subject_id.isin(mimic_cxr.train_subject_ids)]
     test_df = df[df.subject_id.isin(mimic_cxr.test_subject_ids)]
 
-    df_word = pd.read_csv(os.path.join(os.getenv('CACHE_DIR'), 'word_map.csv'))
-
     Dataset = functools.partial(
-        _Dataset,
-        word_to_index=dict(zip(df_word.word, df_word.word_index)),
+        MimicCXRDataset,
+        field=FLAGS.field,
+        min_word_freq=FLAGS.min_word_freq,
         max_report_length=FLAGS.max_report_length,
         max_sentence_length=FLAGS.max_sentence_length,
     )
@@ -204,15 +198,12 @@ def main():
         'view_position_size': train_dataset.num_view_position,
         'vocab_size': len(train_dataset.word_to_index),
         'label_size': 16,  # TODO(stmharry)
-        'optim_cls': torch.optim.Adam,
     })
-    model = Model(**kwargs).to(device)
+    model = DataParallel(Model(**kwargs)).to(device)
+    net = Net(model=model)
     logger.info(model)
 
-    working_dir = os.path.join(FLAGS.working_dir, '{:s}-{:s}'.format(
-        datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S-%f'),
-        model.get_name(),
-    ))
+    working_dir = os.path.join(FLAGS.working_dir, datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S-%f'))
     os.makedirs(working_dir)
     with open(os.path.join(working_dir, 'meta.json'), 'w') as f:
         json.dump(kwargs, f, indent=4)
@@ -222,7 +213,8 @@ def main():
     ### Training Loop
 
     for num_epoch in range(FLAGS.num_epochs):
-        for phase in Phase.__all__:
+        # for phase in Phase.__all__:  # TODO: DEBUG
+        for phase in [Phase.train]:
             log = Log()
 
             data_loader = {
@@ -230,17 +222,20 @@ def main():
                 Phase.test: test_loader,
             }[phase]
 
-            model.pre_epoch(phase=phase)
+            net.pre_epoch(phase=phase)
 
             prog = tqdm.tqdm(enumerate(data_loader), total=len(data_loader))
             for (num_batch, batch) in prog:
+                # if num_batch == 32:
+                #     return
+
                 num_step = num_epoch * len(train_loader) + num_batch
-                model.pre_batch(num_step=num_step)
+                net.pre_batch(num_step=num_step)
 
                 for (key, value) in batch.items():
                     batch[key] = value.to(device=device)
 
-                batch = model.step(batch)
+                batch = net.step_batch(batch)
 
                 # TODO(stmharry)
                 log.update({
@@ -262,31 +257,6 @@ def main():
     writer.close()
 
 
-def make_wordmap(field, min_freq):
-    import tqdm
-
-    from nltk.tokenize.punkt import PunktSentenceTokenizer
-    from nltk.tokenize.casual import TweetTokenizer
-
-    df = pd.read_csv(mimic_cxr.corpus_path(field=field), sep='\t', dtype=str)
-    df = mimic_cxr.inner_merge([('rad_id', df)])
-    df = df[df.subject_id.isin(mimic_cxr.train_subject_ids)]
-
-    sent_tokenizer = PunktSentenceTokenizer()
-    word_tokenizer = TweetTokenizer()
-
-    counter = {}
-    for item in tqdm.tqdm(df.itertuples(), total=len(df)):
-        for sentence in sent_tokenizer.tokenize(item.text):
-            for word in word_tokenizer.tokenize(sentence):
-                counter[word] = counter.get(word, 0) + 1
-
-    df = pd.DataFrame(list(counter.items()), columns=['word', 'word_count']).set_index('word').sort_values('word_count', ascending=False)
-    df['word_index'] = range(1, len(counter) + 1)
-
-    df.to_csv(os.path.join(os.getenv('CACHE_DIR'), 'word_map.csv'))
-
-
 if __name__ == '__main__':
     argv = FLAGS(sys.argv)
 
@@ -297,8 +267,6 @@ if __name__ == '__main__':
 
     logger.info('Loading MIMIC-CXR')
     mimic_cxr = MIMIC_CXR()
-
-    make_wordmap = functools.partial(make_wordmap, field=FLAGS.field, min_freq=1)
 
     if FLAGS.debug:
         FLAGS.num_workers = 0

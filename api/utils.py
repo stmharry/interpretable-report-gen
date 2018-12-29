@@ -2,10 +2,11 @@ import tensorboardX
 import torch
 
 
-def unpad_sequence(tensor, lengths, is_sequence=True):
-    if not is_sequence:
-        tensor = torch.stack([tensor] * int(lengths.max()), 1)
+def expand_to_sequence(tensor, length):
+    return torch.stack([tensor] * int(length), 1)
 
+
+def unpad_sequence(tensor, lengths):
     sequences = tensor.unbind(0)
     sequences = [sequence[:length] for (sequence, length) in zip(sequences, lengths)]
 
@@ -16,26 +17,22 @@ def teacher_sequence(tensor):
     return tensor[:, 1:]
 
 
-def length_sorted(func):
-    def _maybe_slice(value, index):
-        if isinstance(value, torch.Tensor):
-            return value[index]
-        else:
-            return value
+def length_sorted_rnn(use_fields=None):
+    use_fields = use_fields or []
 
-    def _func(*args, **kwargs):
-        length = kwargs.get('length')
+    def _length_sorted_rnn(func):
+        def _func(self, batch, length):
+            index = length.argsort(descending=True)
+            _index = index.argsort()
 
-        assert length is not None
+            batch = func(self, {key: batch[key][index] for key in use_fields}, length[index])
+            return {key: batch[key][_index] for key in batch.keys()}
 
-        index = length.argsort(descending=True)
-        _index = index.argsort()
+        return _func
 
-        _args = [_maybe_slice(value, index) for value in args]
-        _kwargs = {key: _maybe_slice(value, index) for (key, value) in kwargs.items()}
+    return _length_sorted_rnn
 
-        outputs = func(*args, **kwargs)
 
-        return [output[_index] for output in outputs]
-
-    return _func
+def print_batch(batch):
+    for (key, value) in batch.items():
+        print((key, value.shape))

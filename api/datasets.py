@@ -1,8 +1,10 @@
 import nltk
 import os
+import pandas as pd
 import PIL.Image
 import torch
 import torch.utils.data
+import tqdm
 
 from nltk.tokenize.punkt import PunktSentenceTokenizer
 from nltk.tokenize.casual import TweetTokenizer
@@ -19,7 +21,7 @@ from torchvision.transforms import (
 from api import Token
 
 
-class Dataset(torch.utils.data.Dataset):
+class MimicCXRDataset(torch.utils.data.Dataset):
     view_position_to_index = {
         'AP': 1,
         'PA': 2,
@@ -27,9 +29,24 @@ class Dataset(torch.utils.data.Dataset):
         'LATERAL': 3,
     }
 
+    def _wordmap_path(self):
+        return os.path.join(os.getenv('CACHE_DIR'), 'word_map.csv')
+
+    def _make_wordmap(self, field):
+        counter = {}
+        for item in tqdm.tqdm(self.df.itertuples(), total=len(self.df)):
+            for sentence in self.sent_tokenizer.tokenize(item.text):
+                for word in self.word_tokenizer.tokenize(sentence):
+                    counter[word] = counter.get(word, 0) + 1
+
+        df = pd.DataFrame(list(counter.items()), columns=['word', 'word_count'])
+        df = df.set_index('word').sort_values('word_count', ascending=False)
+        df.to_csv(self._wordmap_path())
+
     def __init__(self,
                  df,
-                 word_to_index,
+                 field,
+                 min_word_freq,
                  max_report_length,
                  max_sentence_length,
                  is_train):
@@ -44,12 +61,20 @@ class Dataset(torch.utils.data.Dataset):
 
         self.num_view_position = max(self.view_position_to_index.values()) + 1
 
-        self.word_to_index = {**word_to_index, **{
-            Token.pad: 0,
-            Token.unk: len(word_to_index) + 1,
-            Token.bos: len(word_to_index) + 2,
-            Token.eos: len(word_to_index) + 3,
-        }}
+        if is_train and not os.path.isfile(self._wordmap_path()):
+            self._make_wordmap(field)
+
+        df_word = pd.read_csv(self._wordmap_path(), index_col='word')
+        sel = (df_word.word_count >= min_word_freq)
+        df_word = df_word[sel]
+
+        df_word.loc[Token.eos] = max(df_word.word_count) + 1
+        df_word.loc[Token.unk] = sum(~sel)
+        df_word.loc[Token.bos] = 0
+        df_word.loc[Token.pad] = -1
+
+        df_word = df_word.sort_values('word_count', ascending=False)
+        self.word_to_index = dict(zip(df_word.index, range(len(df_word))))
 
         # TODO(stmharry): ColorJitter
         self.transform = Compose([
