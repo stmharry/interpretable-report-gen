@@ -226,9 +226,6 @@ def main():
 
             prog = tqdm.tqdm(enumerate(data_loader), total=len(data_loader))
             for (num_batch, batch) in prog:
-                # if num_batch == 32:
-                #     return
-
                 num_step = num_epoch * len(train_loader) + num_batch
                 net.pre_batch(num_step=num_step)
 
@@ -248,11 +245,8 @@ def main():
                     [f'{key:s}: {log[key]:8.2e}' for key in sorted(summary_keys)]
                 ))
 
-                if phase == Phase.train:
+                if (phase == Phase.train) or (phase == Phase.test) and (num_batch == len(data_loader) - 1):
                     writer.add_log(log, prefix=phase, global_step=num_step)
-
-            if phase == Phase.test:
-                writer.add_log(log, prefix=phase, global_step=num_step)
 
     writer.close()
 
