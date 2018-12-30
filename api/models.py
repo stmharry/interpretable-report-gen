@@ -33,13 +33,14 @@ class ImageEncoder(ResNet):
     def __init__(self, **kwargs):
         super(ImageEncoder, self).__init__(Bottleneck, [3, 4, 6, 3])
 
-        self.image_size = kwargs['image_size']
+        self.image_size     = kwargs['image_size']
         self.embedding_size = kwargs['embedding_size']
+        self.dropout        = kwargs['dropout']
 
         self.conv1 = Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.avgpool = AdaptiveAvgPool2d((self.image_size, self.image_size))
         self.fc = Conv2d(self.image_embedding_size, self.embedding_size, (1, 1))
-        self.dropout = Dropout(0.5)
+        self.dropout = Dropout(self.dropout)
 
     @profile
     def forward(self, batch):
@@ -78,27 +79,28 @@ class ReportDecoder(Module):
         super(ReportDecoder, self).__init__()
 
         self.view_position_size = kwargs['view_position_size']
-        self.label_size = kwargs['label_size']
-        self.embedding_size = kwargs['embedding_size']
-        self.hidden_size = kwargs['hidden_size']
+        self.label_size         = kwargs['label_size']
+        self.embedding_size     = kwargs['embedding_size']
+        self.hidden_size        = kwargs['hidden_size']
+        self.dropout            = kwargs['dropout']
 
         self.fc_h = Linear(self.embedding_size, self.hidden_size)
         self.fc_m = Linear(self.embedding_size, self.hidden_size)
         self.fc_sizes = [
-            self.label_size,  # label
+            self.label_size,   # label
             self.hidden_size,  # topic
-            1,  # stop
-            1,  # temp
+            1,                 # stop
+            1,                 # temp
         ]
         self.fc = Linear(self.hidden_size, sum(self.fc_sizes))
         self.lstm_sizes = [
-            self.embedding_size,  # image
+            self.embedding_size,      # image
             self.view_position_size,  # view_position
-            1,  # begin
-            self.label_size,  # label
+            1,                        # begin
+            self.label_size,          # label
         ]
         self.lstm_cell = LSTMCell(sum(self.lstm_sizes), self.hidden_size)
-        self.dropout = Dropout(0.5)
+        self.dropout = Dropout(self.dropout)
 
     @length_sorted_rnn(use_fields=['image', 'view_position', 'label'])
     @profile
@@ -164,23 +166,24 @@ class SentenceDecoder(Module):
     def __init__(self, **kwargs):
         super(SentenceDecoder, self).__init__()
 
-        self.image_size = kwargs['image_size']
+        self.image_size         = kwargs['image_size']
         self.view_position_size = kwargs['view_position_size']
-        self.vocab_size = kwargs['vocab_size']
-        self.label_size = kwargs['label_size']
-        self.embedding_size = kwargs['embedding_size']
-        self.hidden_size = kwargs['hidden_size']
+        self.vocab_size         = kwargs['vocab_size']
+        self.label_size         = kwargs['label_size']
+        self.embedding_size     = kwargs['embedding_size']
+        self.hidden_size        = kwargs['hidden_size']
+        self.dropout            = kwargs['dropout']
 
         self.word_embedding = Embedding(self.vocab_size, self.embedding_size)
         self.fc_v = Linear(self.embedding_size, self.hidden_size)
         self.fc_h = Linear(self.embedding_size, self.hidden_size)
         self.fc_m = Linear(self.embedding_size, self.hidden_size)
         self.lstm_sizes = [
-            self.embedding_size,  # image
+            self.embedding_size,      # image
             self.view_position_size,  # view_position
-            self.label_size,  # label
-            self.hidden_size,  # topic
-            self.embedding_size,  # text
+            self.label_size,          # label
+            self.hidden_size,         # topic
+            self.embedding_size,      # text
         ]
         self.lstm_cell = LSTMCell(sum(self.lstm_sizes), self.hidden_size)
         self.fc_sizes = [self.embedding_size, self.embedding_size]  # hidden, sentinel
@@ -189,7 +192,7 @@ class SentenceDecoder(Module):
         self.fc_s = Linear(self.embedding_size, self.hidden_size)
         self.fc_z = Linear(self.hidden_size, 1)
         self.fc_p = Linear(self.embedding_size, self.vocab_size)
-        self.dropout = Dropout(0.5)
+        self.dropout = Dropout(self.dropout)
 
     @length_sorted_rnn(use_fields=['image', 'view_position', 'text', 'label', '_topic', '_temp'])
     @profile
@@ -254,10 +257,12 @@ class SentenceDecoder(Module):
 
             _attention = a.squeeze(2)
             _log_probability = F.log_softmax(self.fc_p(self.dropout(c + hh.squeeze(1))) / temp[:batch_size_t], 1)
+            _text = _log_probability.argmax(1)
 
             outputs.append({
                 '_attention': _attention,
                 '_log_probability': _log_probability,
+                '_text': _text,
             })
 
         return {key: torch.nn.utils.rnn.pad_sequence([output[key] for output in outputs]) for key in outputs[0].keys()}

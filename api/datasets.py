@@ -75,6 +75,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
 
         df_word = df_word.sort_values('word_count', ascending=False)
         self.word_to_index = dict(zip(df_word.index, range(len(df_word))))
+        self.index_to_word = df_word.index
 
         # TODO(stmharry): ColorJitter
         self.transform = Compose([
