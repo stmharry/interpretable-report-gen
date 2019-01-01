@@ -1,4 +1,5 @@
 import nltk
+import numpy as np
 import os
 import pandas as pd
 import PIL.Image
@@ -6,6 +7,7 @@ import torch
 import torch.utils.data
 import tqdm
 
+from gensim.models import Word2Vec, KeyedVectors
 from nltk.tokenize.punkt import PunktSentenceTokenizer
 from nltk.tokenize.casual import TweetTokenizer
 
@@ -29,19 +31,39 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         'LATERAL': 3,
     }
 
-    def _wordmap_path(self):
-        return os.path.join(os.getenv('CACHE_DIR'), 'word_map.csv')
+    def __iter__(self):
+        yield from self._iterate_sentences()
+
+    def _iterate_sentences(self):
+        for item in tqdm.tqdm(self.df.itertuples(), total=len(self.df)):
+            for sentence in self.sent_tokenizer.tokenize(item.text):
+                yield (
+                    [Token.bos] +
+                    self.word_tokenizer.tokenize(sentence) +
+                    [Token.eos]
+                )
+
+    '''
+    def _wordmap_path(self, field):
+        return os.path.join(os.getenv('CACHE_DIR'), f'wordmap-field-{field}.csv')
 
     def _make_wordmap(self, field):
         counter = {}
-        for item in tqdm.tqdm(self.df.itertuples(), total=len(self.df)):
-            for sentence in self.sent_tokenizer.tokenize(item.text):
-                for word in self.word_tokenizer.tokenize(sentence):
-                    counter[word] = counter.get(word, 0) + 1
+        for sentence in self._iterate_sentences():
+            for word in sentence:
+                counter[word] = counter.get(word, 0) + 1
 
         df = pd.DataFrame(list(counter.items()), columns=['word', 'word_count'])
         df = df.set_index('word').sort_values('word_count', ascending=False)
-        df.to_csv(self._wordmap_path())
+        df.to_csv(self._wordmap_path(field=field))
+    '''
+
+    def _word_embedding_path(self, field):
+        return os.path.join(os.getenv('CACHE_DIR'), f'word-embedding-field-{field}.pkl')
+
+    def _make_word_embedding(self, field):
+        word2vec = Word2Vec(self, size=self.embedding_size, min_count=self.min_word_freq, workers=24)
+        word2vec.wv.save(self._word_embedding_path(field=field))
 
     def __init__(self,
                  df,
@@ -49,11 +71,14 @@ class MimicCXRDataset(torch.utils.data.Dataset):
                  min_word_freq,
                  max_report_length,
                  max_sentence_length,
+                 embedding_size,
                  is_train):
 
         self.df = df
+        self.min_word_freq = min_word_freq
         self.max_report_length = max_report_length
         self.max_sentence_length = max_sentence_length
+        self.embedding_size = embedding_size
         self.is_train = is_train
 
         self.sent_tokenizer = PunktSentenceTokenizer()
@@ -61,10 +86,26 @@ class MimicCXRDataset(torch.utils.data.Dataset):
 
         self.num_view_position = max(self.view_position_to_index.values()) + 1
 
-        if is_train and not os.path.isfile(self._wordmap_path()):
-            self._make_wordmap(field)
+        if is_train:
+            '''
+            if not os.path.isfile(self._wordmap_path(field=field)):
+                self._make_wordmap(field=field)
+            '''
 
-        df_word = pd.read_csv(self._wordmap_path(), index_col='word')
+            if not os.path.isfile(self._word_embedding_path(field=field)):
+                self._make_word_embedding(field=field)
+
+        word_vectors = KeyedVectors.load(self._word_embedding_path(field=field))
+
+        self.index_to_word = word_vectors.index2entity + [Token.unk, Token.pad]
+        self.word_to_index = dict(zip(self.index_to_word, range(len(self.index_to_word))))
+        self.word_embedding = np.concatenate([
+            word_vectors.vectors,
+            np.zeros((2, embedding_size)),
+        ], axis=0).astype(np.float32)
+
+        '''
+        df_word = pd.read_csv(self._wordmap_path(field=field), index_col='word')
         sel = (df_word.word_count >= min_word_freq)
         df_word = df_word[sel]
 
@@ -76,6 +117,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         df_word = df_word.sort_values('word_count', ascending=False)
         self.word_to_index = dict(zip(df_word.index, range(len(df_word))))
         self.index_to_word = df_word.index
+        '''
 
         # TODO(stmharry): ColorJitter
         self.transform = Compose([

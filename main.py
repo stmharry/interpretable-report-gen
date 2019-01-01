@@ -1,5 +1,5 @@
 """ TODO """
-# - Pretrained models for image / word embeddings
+# - Pretrained models for image embeddings
 # - Provide labels
 # - Training time annealing
 # - Testing time beam search
@@ -17,7 +17,12 @@ import tqdm
 import warnings
 
 from absl import flags
-from torch.nn import Module, DataParallel, functional as F
+from torch.nn import (
+    functional as F,
+    DataParallel,
+    Module,
+    Embedding,
+)
 
 from mimic_cxr.data import MIMIC_CXR
 from mimic_cxr.utils import Log
@@ -161,6 +166,7 @@ def main():
         min_word_freq=FLAGS.min_word_freq,
         max_report_length=FLAGS.max_report_length,
         max_sentence_length=FLAGS.max_sentence_length,
+        embedding_size=FLAGS.embedding_size,
     )
     train_dataset = Dataset(
         df=train_df,
@@ -193,7 +199,10 @@ def main():
         'vocab_size': len(train_dataset.word_to_index),
         'label_size': 16,  # TODO(stmharry)
     })
-    model = DataParallel(Model(**kwargs)).to(device)
+    model = Model(**kwargs)
+    model.sentence_decoder.word_embedding = Embedding.from_pretrained(torch.from_numpy(train_dataset.word_embedding))
+
+    model = DataParallel(model).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=FLAGS.lr)
     logger.info(model)
 
