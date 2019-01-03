@@ -6,10 +6,12 @@ import PIL.Image
 import torch
 import torch.utils.data
 import tqdm
+import re
 
 from gensim.models import Word2Vec, KeyedVectors
 from nltk.tokenize.punkt import PunktSentenceTokenizer
 from nltk.tokenize.casual import TweetTokenizer
+from sklearn.preprocessing import MultiLabelBinarizer
 
 from torch.nn.utils.rnn import (
     pad_sequence,
@@ -57,6 +59,44 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         df = df.set_index('word').sort_values('word_count', ascending=False)
         df.to_csv(self._wordmap_path(field=field))
     '''
+    def _read_categories_df(self):
+        sentence_categories_csv_path = '../data/Sentence Labeling Categories - Categories.csv'
+        return pd.read_csv(sentence_categories_csv_path,header=[0, 1])
+
+    def _fit_binarizer(self):
+        '''
+        transform categories into 1D vec and prepare for regex
+        '''
+        cols = self.sentence_categories_df.columns.tolist()
+        mlb = MultiLabelBinarizer()
+        cols_fixed = []
+        st = set()
+        last_lvl1 = None
+        for (lvl1, lvl2) in cols:
+            if lvl1.startswith('Unnamed'): 
+                st.add(lvl2)
+                cols_fixed.append((last_lvl1, lvl2))
+            else:
+                st.add(lvl1)
+                st.add(lvl2)
+                cols_fixed.append((lvl1, lvl2))
+                last_lvl1 = lvl1
+        lst = [st]
+        mlb.fit_transform(lst)
+        self.sentence_categories_df.columns = pd.MultiIndex.from_tuples(cols_fixed)
+        return mlb
+
+    def _sentence_labeler(self, s):
+        punct_to_remove = ''.join([x for x in string.punctuation if x != '-'])
+        s = s.translate(punct_to_remove).lower()
+        categories = []
+        for col in self.sentence_categories_df.columns.tolist():
+            regex_set = set(['(^|\s)%s($|\s)' % x for x in self.sentence_categories_df[col] if type(x) is str])
+            for r in regex_set:
+                if len(re.findall(r, s)) > 0:
+                    categories.append(col)
+                    break
+        return categories
 
     def _word_embedding_path(self, field):
         return os.path.join(os.getenv('CACHE_DIR'), f'word-embedding-field-{field}.pkl')
@@ -103,6 +143,9 @@ class MimicCXRDataset(torch.utils.data.Dataset):
             word_vectors.vectors,
             np.zeros((2, embedding_size)),
         ], axis=0).astype(np.float32)
+    
+        self.sentence_categories_df = self._read_categories_df()
+        self.binarizer = self._fit_binarizer()
 
         '''
         df_word = pd.read_csv(self._wordmap_path(field=field), index_col='word')
@@ -146,6 +189,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         if self.is_train:
             text = []
             sent_length = []
+            category = []
 
             sentences = self.sent_tokenizer.tokenize(item.text)
             sentences = [''] + sentences[:min(len(sentences), self.max_report_length)]
@@ -165,12 +209,20 @@ class MimicCXRDataset(torch.utils.data.Dataset):
                 text.append(words)
                 sent_length.append(num_words + 2)
 
+                categories = self._sentence_labeler(sentence)
+                st = set()
+                for (lv1, lv2) in categories:
+                    st.add(lv1)
+                    st.add(lv2)
+                cat_vec = torch.as_tensor(self.binarizer.transform([st]).flatten())
+                category.append(cat_vec)
+
             text = torch.stack(text, 0)
             sent_length = torch.as_tensor(sent_length, dtype=torch.long)
             text_length = torch.as_tensor(sent_length.numel(), dtype=torch.long)
 
             # TODO(stmharry): really load label
-            label = torch.ones((text_length, 16), dtype=torch.float)
+            label = torch.as_tensor(category,dtype=torch.long)
 
             num = torch.arange(text_length, dtype=torch.long).unsqueeze(1)
             stop = torch.as_tensor(num == text_length - 1, dtype=torch.float)

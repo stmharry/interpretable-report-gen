@@ -1,0 +1,25 @@
+Bone,Other,,,,,Lung,,,,,,Heart,,Pleural
+Bone,Prior,Patient Position,Communication,Anatomy,Instrument (e.g. Tubes),Consolidation,Edema,Interstitial Disease,Atelectasis,Mass/Nodule,Other Lung,Peridcardium,Heart,Pleural
+rib,prior,pa,[a-zA-Z]*phone,right upper,tube,patch,fluid overload,reticular,(hydro)?pneumothorax,mass(es)?,cavit[a-zA-Z]*,pericardi[a-zA-Z]*,[a-zA-Z]*cardi[a-zA-Z]*,pleura[a-zA-Z]*
+cage,again,lateral,communicat[a-zA-Z]*,right middle,line,consolidation,vascular congestion,interstitial,lower lung volumes,solitary,hyperinflated,pericardial effusion,heart,effusion
+spine,interval,ap,page[a-zA-Z]*,right lower,hardware,homogeneous,vascular marking,ground glass,collapse,rounded,,,cardiothoracic,
+clavicle,previous,rotation,,left middle,device(s?),air-bronchogra[a-zA-Z]*,vascular pedicle,cystic,hemothorax,nodule(s)?,,,,
+scolio[a-zA-Z]*,,view,,left upper,placement,ill-defined,edema,kerley b,decreased lung volume,metastatic,,,,
+lumbar,,bedside,,left lower,rods,no volume loss,,,atelecta[a-zA-Z]*,metastases,,,,
+lordo[a-zA-Z]*,,,,lingula,clip,white out,,,,,,,,
+fracture(s)?,,,,trachea,surgical,,,,,,,,,
+degenerat[a-zA-Z]*,,,,mediastin[a-zA-Z]*,cath[a-zA-Z]*,,,,,,,,,
+bony,,,,hilar,port-a-cath[a-zA-Z]*,,,,,,,,,
+osseo[a-zA-Z]*,,,,hilu[a-zA-Z]*,,,,,,,,,,
+bone(s?),,,,basilar,,,,,,,,,,
+,,,,base,,,,,,,,,,
+,,,,[a-zA-Z]*diaphragm[a-zA-Z]*,,,,,,,,,,
+,,,,apex,,,,,,,,,,
+,,,,perihilar,,,,,,,,,,
+,,,,basal,,,,,,,,,,
+,,,,quadrant,,,,,,,,,,
+,,,,apic[a-zA-Z]*,,,,,,,,,,
+,,,,right-sided,,,,,,,,,,
+,,,,left-sided,,,,,,,,,,
+,,,,right,,,,,,,,,,
+,,,,left,,,,,,,,,,
