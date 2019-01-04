@@ -215,9 +215,10 @@ class MimicCXRDataset(torch.utils.data.Dataset):
                 for (lv1, lv2) in categories:
                     st.add(lv1)
                     st.add(lv2)
-                cat_vec = torch.as_tensor(self.binarizer.transform([st]).flatten())
+                cat_vec = torch.as_tensor((self.binarizer.transform([st]).flatten()), dtype=torch.long)
                 category.append(cat_vec)
-
+            print(text)
+            print(category)
             text = torch.stack(text, 0)
             sent_length = torch.as_tensor(sent_length, dtype=torch.long)
             text_length = torch.as_tensor(sent_length.numel(), dtype=torch.long)
