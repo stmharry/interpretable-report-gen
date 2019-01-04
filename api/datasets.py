@@ -215,7 +215,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
                 for (lv1, lv2) in categories:
                     st.add(lv1)
                     st.add(lv2)
-                cat_vec = torch.as_tensor((self.binarizer.transform([st]).flatten()), dtype=torch.long)
+                cat_vec = self.binarizer.transform([st]).flatten()
                 category.append(cat_vec)
         
             text = torch.stack(text, 0)
@@ -223,7 +223,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
             text_length = torch.as_tensor(sent_length.numel(), dtype=torch.long)
 
             # TODO(stmharry): really load label
-            label = category
+            label = torch.as_tensor(category, dtype=torch.float)
 
             num = torch.arange(text_length, dtype=torch.long).unsqueeze(1)
             stop = torch.as_tensor(num == text_length - 1, dtype=torch.float)
