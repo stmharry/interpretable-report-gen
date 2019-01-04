@@ -222,6 +222,8 @@ class MimicCXRDataset(torch.utils.data.Dataset):
             sent_length = torch.as_tensor(sent_length, dtype=torch.long)
             text_length = torch.as_tensor(sent_length.numel(), dtype=torch.long)
 
+            print("sentleng",sent_length)
+            print("textleng", text_length)
             # TODO(stmharry): really load label
             label = torch.as_tensor(category,dtype=torch.float)
 
