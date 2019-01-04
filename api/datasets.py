@@ -224,6 +224,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
 
             # TODO(stmharry): really load label
             label = category
+            print(label)
 
             num = torch.arange(text_length, dtype=torch.long).unsqueeze(1)
             stop = torch.as_tensor(num == text_length - 1, dtype=torch.float)
