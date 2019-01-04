@@ -7,6 +7,7 @@ import torch
 import torch.utils.data
 import tqdm
 import re
+import string
 
 from gensim.models import Word2Vec, KeyedVectors
 from nltk.tokenize.punkt import PunktSentenceTokenizer
