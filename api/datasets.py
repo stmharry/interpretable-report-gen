@@ -60,7 +60,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         df.to_csv(self._wordmap_path(field=field))
     '''
     def _read_categories_df(self):
-        sentence_categories_csv_path = '../data/Sentence Labeling Categories - Categories.csv'
+        sentence_categories_csv_path = '/crimea/liuguanx/interpretable-report-gen/data/Sentence Labeling Categories - Categories.csv'
         return pd.read_csv(sentence_categories_csv_path,header=[0, 1])
 
     def _fit_binarizer(self):
