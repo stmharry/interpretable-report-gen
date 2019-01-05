@@ -193,7 +193,7 @@ def main():
         'image_embedding_size': ImageEncoder.image_embedding_size,
         'view_position_size': train_dataset.num_view_position,
         'vocab_size': len(train_dataset.word_to_index),
-        'label_size': 16,  # TODO(stmharry)
+        'label_size': 17,  # TODO(stmharry)
     })
     model = Model(**kwargs)
     model.sentence_decoder.word_embedding = Embedding.from_pretrained(torch.from_numpy(train_dataset.word_embedding))
