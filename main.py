@@ -84,7 +84,6 @@ class Model(Module):
 
     def forward(self, batch):
         """
-
         Args:
             image
             view_position
@@ -93,7 +92,6 @@ class Model(Module):
             label
             stop
             sent_length
-
         """
 
         batch.update(self.image_encoder(batch))  # image
@@ -127,12 +125,10 @@ class Model(Module):
 
     def decode(self, batch):
         """
-
         Args:
             image
             view_position
             label
-
         """
 
         batch.update(self.image_encoder(batch))  # image
