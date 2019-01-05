@@ -232,7 +232,6 @@ def main():
                     optimizer.zero_grad()
 
                 for (key, value) in batch.items():
-                    print((key,value))
                     batch[key] = value.to(device=device)
 
                 batch = model.forward(batch)
