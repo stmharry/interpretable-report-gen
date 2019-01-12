@@ -147,8 +147,9 @@ class ReportDecoder(Module):
 
             (h, m) = self.lstm_cell(x, (h, m))
             (_label, _topic, _stop, _temp) = self.fc(self.dropout(h)).split(self.fc_sizes, 1)
-            print(_label)
             # TODO(stmharry): on label apply softmax group
+            _label = torch.sigmoid(_label)
+            _label = torch.where(_label >= 0.5, torch.float(1), torch.float(0))
             _topic = F.relu(_topic)
             _stop = torch.sigmoid(_stop)
             _temp = torch.exp(_temp)
