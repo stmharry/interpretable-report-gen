@@ -69,12 +69,12 @@ class MimicCXRDataset(torch.utils.data.Dataset):
     def _read_categories_df(self):
         return pd.read_csv(self._sentence_labels_regex_path(),header=[0, 1])
     
-    def _sentence_labeler(self, s):
+    def _sentence_labeler(self, s, sentence_categories_df):
         punct_to_remove = ''.join([x for x in string.punctuation if x != '-'])
         s = s.translate(punct_to_remove).lower()
         categories = []
-        for col in self.sentence_categories_df.columns.tolist():
-            regex_set = set(['(^|\s)%s($|\s)' % x for x in self.sentence_categories_df[col] if type(x) is str])
+        for col in sentence_categories_df.columns.tolist():
+            regex_set = set(['(^|\s)%s($|\s)' % x for x in sentence_categories_df[col] if type(x) is str])
             for r in regex_set:
                 if len(re.findall(r, s)) > 0:
                     categories.append(col)
@@ -82,6 +82,8 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         return categories
     
     def _make_labels(self, field):
+        sentence_categories_df = self._read_categories_df()
+        binarizer = self._fit_binarizer(sentence_categories_df)
         labels = []
         for index in range(len(self.df)):
             item = self.df.iloc[index]
@@ -97,21 +99,20 @@ class MimicCXRDataset(torch.utils.data.Dataset):
 
                 new_sentence = ''.join(words)
 
-                categories = self._sentence_labeler(new_sentence)
+                categories = self._sentence_labeler(new_sentence, sentence_categories_df)
                 st = set()
                 for (lv1, lv2) in categories:
-                    st.add(lv1)
                     st.add(lv2)
-                cat_vec = self.binarizer.transform([st]).flatten()
+                cat_vec = binarizer.transform([st]).flatten()
                 category.append(cat_vec)
             labels.append(torch.as_tensor(category, dtype=torch.float))
         torch.save(labels, self._labels_path(field=field))
 
-    def _fit_binarizer(self):
+    def _fit_binarizer(self, sentence_categories_df):
         '''
         transform categories into 1D vec and prepare for regex
         '''
-        cols = self.sentence_categories_df.columns.tolist()
+        cols = sentence_categories_df.columns.tolist()
         mlb = MultiLabelBinarizer()
         cols_fixed = []
         st = set()
@@ -127,7 +128,8 @@ class MimicCXRDataset(torch.utils.data.Dataset):
                 last_lvl1 = lvl1
         lst = [st]
         mlb.fit_transform(lst)
-        self.sentence_categories_df.columns = pd.MultiIndex.from_tuples(cols_fixed)
+        sentence_categories_df.columns = pd.MultiIndex.from_tuples(cols_fixed)
+        # Check if sentence_categories_df is mutable
         return mlb
 
     def _word_embedding_path(self, field):
