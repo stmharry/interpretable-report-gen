@@ -169,8 +169,6 @@ class MimicCXRDataset(torch.utils.data.Dataset):
             if not os.path.isfile(self._word_embedding_path(field=field)):
                 self._make_word_embedding(field=field)
             if not os.path.isfile(self._labels_path(field=field)):
-                self.sentence_categories_df = self._read_categories_df()
-                self.binarizer = self._fit_binarizer()
                 self._make_labels(field=field)
 
         word_vectors = KeyedVectors.load(self._word_embedding_path(field=field))
