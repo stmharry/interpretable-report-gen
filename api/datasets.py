@@ -1,7 +1,5 @@
-import nltk
 import numpy as np
 import os
-import pandas as pd
 import PIL.Image
 import torch
 import torch.utils.data
@@ -14,14 +12,7 @@ from nltk.tokenize.punkt import PunktSentenceTokenizer
 from nltk.tokenize.casual import TweetTokenizer
 from sklearn.preprocessing import MultiLabelBinarizer
 
-from torch.nn.utils.rnn import (
-    pad_sequence,
-    pack_padded_sequence,
-)
-from torchvision.transforms import (
-    Compose,
-    ToTensor,
-)
+from torchvision.transforms import Compose, ToTensor
 
 from api import Token
 
@@ -181,21 +172,6 @@ class MimicCXRDataset(torch.utils.data.Dataset):
             word_vectors.vectors,
             np.zeros((2, embedding_size)),
         ], axis=0).astype(np.float32)
-
-        '''
-        df_word = pd.read_csv(self._wordmap_path(field=field), index_col='word')
-        sel = (df_word.word_count >= min_word_freq)
-        df_word = df_word[sel]
-
-        df_word.loc[Token.eos] = max(df_word.word_count) + 1
-        df_word.loc[Token.unk] = sum(~sel)
-        df_word.loc[Token.bos] = 0
-        df_word.loc[Token.pad] = -1
-
-        df_word = df_word.sort_values('word_count', ascending=False)
-        self.word_to_index = dict(zip(df_word.index, range(len(df_word))))
-        self.index_to_word = df_word.index
-        '''
 
         # TODO(stmharry): ColorJitter
         self.transform = Compose([

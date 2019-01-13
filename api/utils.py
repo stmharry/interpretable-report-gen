@@ -15,10 +15,10 @@ def pack_padded_sequence(tensor, lengths):
     return torch.cat(sequences, 0)
 
 
-def pad_packed_sequence(tensor, lengths):
+def pad_packed_sequence(tensor, lengths, padding_value=0):
     sequences = tensor.split(lengths.tolist(), 0)
 
-    return torch.nn.utils.rnn.pad_sequence(sequences, batch_first=True)
+    return torch.nn.utils.rnn.pad_sequence(sequences, batch_first=True, padding_value=padding_value)
 
 
 def teacher_sequence(tensor):
