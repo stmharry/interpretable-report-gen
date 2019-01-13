@@ -1,8 +1,10 @@
 """ TODO """
-# - Pretrained models for image embeddings
-# - Provide labels
-# - Training time annealing
-# - Testing time beam search
+# Train all from scratch
+# Pretrain w/ label then train
+# Pretrained models for image embeddings
+# Training time annealing
+# Reinforcement Learning on CIDEr
+# Testing time beam search
 
 import datetime
 import functools
@@ -113,7 +115,8 @@ class Model(Module):
             batch[key] = pack_padded_sequence(batch[key], batch['text_length'] - 1)
 
         # Forwarding for Sentence Level
-        batch.update(self.sentence_decoder(batch, length=batch['sent_length']))  # _attention, _log_probability
+        # batch.update(self.sentence_decoder(batch, length=batch['sent_length']))  # _attention, _log_probability
+        _batch = self.sentence_decoder.decode(batch)  # TODO: DEBUG
 
         # Teacher-forcing for Sentence Level
         for key in ['text']:
@@ -124,19 +127,6 @@ class Model(Module):
             batch[key] = pack_padded_sequence(batch[key], batch['sent_length'] - 1)
 
         return batch
-
-    def decode(self, batch):
-        """
-
-        Args:
-            image
-            view_position
-            label
-
-        """
-
-        batch.update(self.image_encoder(batch))  # image
-        self.report_decoder.decode(batch)
 
 
 def main():
@@ -194,9 +184,8 @@ def main():
 
     kwargs = FLAGS.flag_values_dict()
     kwargs.update({
-        'image_embedding_size': ImageEncoder.image_embedding_size,
+        'word_to_index': train_dataset.word_to_index,
         'view_position_size': train_dataset.num_view_position,
-        'vocab_size': len(train_dataset.word_to_index),
         'label_size': 16,  # TODO(stmharry)
     })
     model = Model(**kwargs)
@@ -236,9 +225,14 @@ def main():
                     optimizer.zero_grad()
 
                 for (key, value) in batch.items():
-                    batch[key] = value.to(device=device)
+                    batch[key] = value.to(device)
 
-                batch = model.forward(batch)
+                if phase == Phase.train:
+                    batch = model.forward(batch)
+                elif phase == Phase.test:
+                    with torch.no_grad():
+                        batch = model.decode(batch)
+
                 losses = {
                     'stop_bce': F.binary_cross_entropy(batch['_stop'], batch['stop']),
                     'word_ce': F.nll_loss(batch['_log_probability'], batch['text']),

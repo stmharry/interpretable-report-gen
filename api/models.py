@@ -10,7 +10,6 @@ from torch.nn import (
     Embedding,
     Linear,
     Dropout,
-    AdaptiveLogSoftmaxWithLoss,
 )
 
 from torchvision.models.resnet import (
@@ -18,7 +17,8 @@ from torchvision.models.resnet import (
     Bottleneck,
 )
 
-from api.utils import length_sorted_rnn
+from api import Token
+from api.utils import length_sorted_rnn, pack_padded_sequence, pad_packed_sequence
 
 logger = logging.getLogger(__name__)
 
@@ -135,7 +135,7 @@ class ReportDecoder(Module):
             logger.debug(f'ReportDecoder.forward(): time_step={t}')
             batch_size_t = torch.sum(length - 1 > t)
 
-            begin = torch.ones((batch_size_t, 1), dtype=torch.float, device=label.device) * (t == 0)
+            begin = torch.ones((batch_size_t, 1), dtype=torch.float).cuda() * (t == 0)
             x = torch.cat([
                 self.dropout(image_mean[:batch_size_t]),
                 view_position[:batch_size_t],
@@ -159,20 +159,24 @@ class ReportDecoder(Module):
                 '_temp': _temp,
             })
 
-        return {key: torch.nn.utils.rnn.pad_sequence([output[key] for output in outputs]) for key in outputs[0].keys()}
+        outputs = {key: torch.nn.utils.rnn.pad_sequence([output[key] for output in outputs]) for key in outputs[0].keys()}
+        return outputs
 
 
 class SentenceDecoder(Module):
     def __init__(self, **kwargs):
         super(SentenceDecoder, self).__init__()
 
-        self.image_size         = kwargs['image_size']
-        self.view_position_size = kwargs['view_position_size']
-        self.vocab_size         = kwargs['vocab_size']
-        self.label_size         = kwargs['label_size']
-        self.embedding_size     = kwargs['embedding_size']
-        self.hidden_size        = kwargs['hidden_size']
-        self.dropout            = kwargs['dropout']
+        self.image_size          = kwargs['image_size']
+        self.view_position_size  = kwargs['view_position_size']
+        self.word_to_index       = kwargs['word_to_index']
+        self.label_size          = kwargs['label_size']
+        self.embedding_size      = kwargs['embedding_size']
+        self.hidden_size         = kwargs['hidden_size']
+        self.dropout             = kwargs['dropout']
+        self.max_sentence_length = kwargs['max_sentence_length']
+
+        self.vocab_size = len(self.word_to_index)
 
         self.word_embedding = Embedding(self.vocab_size, self.embedding_size)
         self.fc_v = Linear(self.embedding_size, self.hidden_size)
@@ -226,7 +230,6 @@ class SentenceDecoder(Module):
         image_mean = image.mean(1)
 
         v = self.fc_v(self.dropout(image))
-
         h = torch.tanh(self.fc_h(self.dropout(image_mean)))
         m = torch.tanh(self.fc_m(self.dropout(image_mean)))
 
@@ -265,4 +268,117 @@ class SentenceDecoder(Module):
                 '_text': _text,
             })
 
-        return {key: torch.nn.utils.rnn.pad_sequence([output[key] for output in outputs]) for key in outputs[0].keys()}
+        outputs = {key: torch.nn.utils.rnn.pad_sequence([output[key] for output in outputs]) for key in outputs[0].keys()}
+        return outputs
+
+    @profile
+    def decode(self, batch, beam_size=4):
+
+        """
+
+        Args:
+            image (batch_size, image_size * image_size, hidden_size): Image feature map.
+            view_position (batch_size, view_position_size): Patient positions.
+            label (batch_size, label_size): Interpretable labels.
+            topic (batch_size, embedding_size): Topic embeddings.
+            temp (batch_size,): Temperature parameters.
+
+        Returns:
+
+        """
+
+
+        image         = batch['image']
+        view_position = batch['view_position']
+        label         = batch['label']
+        topic         = batch['_topic']
+        temp          = batch['_temp']
+
+        image_mean = image.mean(1)
+
+        batch_size = len(batch['label'])
+        batch_index = torch.arange(batch_size, dtype=torch.long).view(-1, 1).expand(-1, beam_size).reshape(-1).cuda()
+
+        v = self.fc_v(self.dropout(image))
+        h = torch.tanh(self.fc_h(self.dropout(image_mean)))[batch_index]
+        m = torch.tanh(self.fc_m(self.dropout(image_mean)))[batch_index]
+
+        _text = torch.zeros((batch_size * beam_size, 0), dtype=torch.long).cuda()
+        _this_text = torch.full((batch_size * beam_size, 1), self.word_to_index[Token.bos], dtype=torch.long).cuda()
+        _sum_log_probability = torch.zeros((batch_size * beam_size, 1), dtype=torch.float).cuda()
+
+        outputs = []
+        for t in range(self.max_sentence_length + 1):
+            logger.debug(f'SentenceDecoder.decode(): time_step={t}, num_sentences={len(batch_index)}')
+
+            batch_length = torch.sum(batch_index.view(-1, 1) == torch.arange(batch_size).view(1, -1).cuda(), 0)
+            batch_begin = batch_length.sum() - batch_length.flip(0).cumsum(0).flip(0)
+
+            _text_embedding = self.word_embedding(_this_text.view(-1))
+            x = torch.cat([
+                self.dropout(image_mean[batch_index]),
+                view_position[batch_index],
+                label[batch_index],
+                self.dropout(topic[batch_index]),
+                self.dropout(_text_embedding),
+            ], 1)
+
+            (h, m) = self.lstm_cell(x, (h, m))
+            (hh, s) = F.relu(self.fc(self.dropout(h))).unsqueeze(1).split(self.fc_sizes, 2)
+            _hh = self.fc_hh(self.dropout(hh))
+            _s = self.fc_s(self.dropout(s))
+
+            z = torch.tanh(torch.cat([v[batch_index], _s], 1) + _hh)
+            z = self.fc_z(self.dropout(z))
+            a = F.softmax(z, 1)
+            c = torch.sum(a * torch.cat([image[batch_index], s], 1), 1)
+
+            _attention = a.squeeze(2)
+            _log_probability = F.log_softmax(self.fc_p(self.dropout(c + hh.squeeze(1))) / temp[batch_index], 1)
+
+            _log_probability = _sum_log_probability + _log_probability
+            _log_probability = pad_packed_sequence(_log_probability, batch_length, padding_value=float('-inf'))
+            (_sum_log_probability, _top_index) = _log_probability.view(batch_size, -1, 1).topk(beam_size, 1)
+
+            _sum_log_probability = pack_padded_sequence(_sum_log_probability, batch_length)
+            _index = pack_padded_sequence(_top_index / self.vocab_size + batch_begin.view(-1, 1, 1), batch_length).squeeze(1)
+            _this_text = pack_padded_sequence(_top_index % self.vocab_size, batch_length)
+
+            _this_text[-1] = self.word_to_index[Token.eos]  # DEBUG
+
+            if t == self.max_sentence_length:
+                _this_text = torch.full((len(batch_index), 1), self.word_to_index[Token.eos], dtype=torch.long).cuda()
+
+            _text = torch.cat([_text[_index], _this_text], 1)
+            is_end = (_this_text == self.word_to_index[Token.eos]).squeeze(1)
+
+            if is_end.any():
+                output = {
+                    '_index': batch_index[is_end].unsqueeze(1),
+                    '_attention': _attention[is_end],
+                    '_log_probability': _sum_log_probability[is_end],
+                    '_text': _text[is_end],
+                }
+                outputs.extend([dict(zip(output.keys(), values)) for values in zip(*output.values())])
+
+                batch_index = batch_index[~is_end]
+                h = h[~is_end]
+                m = m[~is_end]
+                _sum_log_probability = _sum_log_probability[~is_end]
+                _this_text = _this_text[~is_end]
+                _text = _text[~is_end]
+
+            if is_end.all():
+                break
+
+        outputs = {key: torch.nn.utils.rnn.pad_sequence([output[key] for output in outputs], batch_first=True) for key in outputs[0].keys()}
+
+        _index = outputs['_index'].squeeze(1).argsort(0)
+        outputs = {key: value[_index].view(batch_size, beam_size, -1) for (key, value) in outputs.items()}
+
+        _index = outputs['_log_probability'].argsort(1, descending=True)
+        batch_begin = torch.arange(0, batch_size * beam_size, beam_size).view(-1, 1, 1).cuda()
+        _index = (_index + batch_begin).view(-1)
+        outputs = {key: value.view(batch_size * beam_size, -1)[_index].view(batch_size, beam_size, -1) for (key, value) in outputs.items()}
+
+        return outputs
