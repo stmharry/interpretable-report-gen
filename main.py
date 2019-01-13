@@ -136,9 +136,7 @@ class Model(Module):
 
 
 def main():
-    # Set device
-    torch.cuda.set_device(2)
-
+    
     logger.info('Loading meta')
     df_meta = pd.read_csv(mimic_cxr.meta_path())
 
