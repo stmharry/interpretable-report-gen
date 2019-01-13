@@ -1,7 +1,5 @@
-import nltk
 import numpy as np
 import os
-import pandas as pd
 import PIL.Image
 import torch
 import torch.utils.data
@@ -11,14 +9,7 @@ from gensim.models import Word2Vec, KeyedVectors
 from nltk.tokenize.punkt import PunktSentenceTokenizer
 from nltk.tokenize.casual import TweetTokenizer
 
-from torch.nn.utils.rnn import (
-    pad_sequence,
-    pack_padded_sequence,
-)
-from torchvision.transforms import (
-    Compose,
-    ToTensor,
-)
+from torchvision.transforms import Compose, ToTensor
 
 from api import Token
 
@@ -42,21 +33,6 @@ class MimicCXRDataset(torch.utils.data.Dataset):
                     self.word_tokenizer.tokenize(sentence) +
                     [Token.eos]
                 )
-
-    '''
-    def _wordmap_path(self, field):
-        return os.path.join(os.getenv('CACHE_DIR'), f'wordmap-field-{field}.csv')
-
-    def _make_wordmap(self, field):
-        counter = {}
-        for sentence in self._iterate_sentences():
-            for word in sentence:
-                counter[word] = counter.get(word, 0) + 1
-
-        df = pd.DataFrame(list(counter.items()), columns=['word', 'word_count'])
-        df = df.set_index('word').sort_values('word_count', ascending=False)
-        df.to_csv(self._wordmap_path(field=field))
-    '''
 
     def _word_embedding_path(self, field):
         return os.path.join(os.getenv('CACHE_DIR'), f'word-embedding-field-{field}.pkl')
@@ -86,14 +62,8 @@ class MimicCXRDataset(torch.utils.data.Dataset):
 
         self.num_view_position = max(self.view_position_to_index.values()) + 1
 
-        if is_train:
-            '''
-            if not os.path.isfile(self._wordmap_path(field=field)):
-                self._make_wordmap(field=field)
-            '''
-
-            if not os.path.isfile(self._word_embedding_path(field=field)):
-                self._make_word_embedding(field=field)
+        if is_train and not os.path.isfile(self._word_embedding_path(field=field)):
+            self._make_word_embedding(field=field)
 
         word_vectors = KeyedVectors.load(self._word_embedding_path(field=field))
 
@@ -103,21 +73,6 @@ class MimicCXRDataset(torch.utils.data.Dataset):
             word_vectors.vectors,
             np.zeros((2, embedding_size)),
         ], axis=0).astype(np.float32)
-
-        '''
-        df_word = pd.read_csv(self._wordmap_path(field=field), index_col='word')
-        sel = (df_word.word_count >= min_word_freq)
-        df_word = df_word[sel]
-
-        df_word.loc[Token.eos] = max(df_word.word_count) + 1
-        df_word.loc[Token.unk] = sum(~sel)
-        df_word.loc[Token.bos] = 0
-        df_word.loc[Token.pad] = -1
-
-        df_word = df_word.sort_values('word_count', ascending=False)
-        self.word_to_index = dict(zip(df_word.index, range(len(df_word))))
-        self.index_to_word = df_word.index
-        '''
 
         # TODO(stmharry): ColorJitter
         self.transform = Compose([
