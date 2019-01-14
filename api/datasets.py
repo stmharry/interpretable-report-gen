@@ -111,6 +111,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
 
                 # categories = self._sentence_labeler(new_sentence, sentence_categories_df)
                 punct_to_remove = ''.join([x for x in string.punctuation if x != '-'])
+                s = new_sentence
                 s = s.translate(punct_to_remove).lower()
                 categories = []
                 for col in sentence_categories_df.columns.tolist():
