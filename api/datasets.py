@@ -83,13 +83,11 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         last_lvl1 = None
         for (lvl1, lvl2) in cols:
             if lvl1.startswith('Unnamed'): 
-                st.add(lvl2)
                 cols_fixed.append((last_lvl1, lvl2))
             else:
-                st.add(lvl1)
-                st.add(lvl2)
                 cols_fixed.append((lvl1, lvl2))
                 last_lvl1 = lvl1
+            st.add(lvl2)
         lst = [st]
         mlb.fit_transform(lst)
         sentence_categories_df.columns = pd.MultiIndex.from_tuples(cols_fixed)
