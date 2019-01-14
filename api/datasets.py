@@ -75,7 +75,25 @@ class MimicCXRDataset(torch.utils.data.Dataset):
     
     def _make_labels(self, field):
         sentence_categories_df = self._read_categories_df()
-        binarizer = self._fit_binarizer(sentence_categories_df)
+        # mlb = self._fit_binarizer(sentence_categories_df)
+        cols = sentence_categories_df.columns.tolist()
+        mlb = MultiLabelBinarizer()
+        cols_fixed = []
+        st = set()
+        last_lvl1 = None
+        for (lvl1, lvl2) in cols:
+            if lvl1.startswith('Unnamed'): 
+                st.add(lvl2)
+                cols_fixed.append((last_lvl1, lvl2))
+            else:
+                st.add(lvl1)
+                st.add(lvl2)
+                cols_fixed.append((lvl1, lvl2))
+                last_lvl1 = lvl1
+        lst = [st]
+        mlb.fit_transform(lst)
+        sentence_categories_df.columns = pd.MultiIndex.from_tuples(cols_fixed)
+
         labels = []
         for index in range(len(self.df)):
             item = self.df.iloc[index]
@@ -91,11 +109,21 @@ class MimicCXRDataset(torch.utils.data.Dataset):
 
                 new_sentence = ''.join(words)
 
-                categories = self._sentence_labeler(new_sentence, sentence_categories_df)
+                # categories = self._sentence_labeler(new_sentence, sentence_categories_df)
+                punct_to_remove = ''.join([x for x in string.punctuation if x != '-'])
+                s = s.translate(punct_to_remove).lower()
+                categories = []
+                for col in sentence_categories_df.columns.tolist():
+                    regex_set = set(['(^|\s)%s($|\s)' % x for x in sentence_categories_df[col] if type(x) is str])
+                    for r in regex_set:
+                        if len(re.findall(r, s)) > 0:
+                            categories.append(col)
+                            break
+
                 st = set()
                 for (lv1, lv2) in categories:
                     st.add(lv2)
-                cat_vec = binarizer.transform([st]).flatten()
+                cat_vec = mlb.transform([st]).flatten()
                 category.append(cat_vec)
             labels.append(torch.as_tensor(category, dtype=torch.float))
         torch.save(labels, self._labels_path(field=field))
