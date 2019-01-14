@@ -225,6 +225,7 @@ def main():
 
                 for (key, value) in batch.items():
                     batch[key] = value.to(device)
+                    print(batch)
 
                 if phase == Phase.train:
                     batch = model.forward(batch)
