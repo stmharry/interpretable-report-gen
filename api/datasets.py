@@ -164,6 +164,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
 
         word_vectors = KeyedVectors.load(self._word_embedding_path(field=field))
         self.labels = torch.load(self._labels_path(field=field))
+        print(self.labels)
 
 
         self.index_to_word = word_vectors.index2entity + [Token.unk, Token.pad]
