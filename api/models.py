@@ -155,7 +155,7 @@ class ReportDecoder(Module):
             _temp = torch.exp(_temp)
 
             outputs.append({
-                # '_label': _label,
+                '_label': _label,
                 '_topic': _topic,
                 '_stop': _stop,
                 '_temp': _temp,
