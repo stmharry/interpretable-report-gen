@@ -103,22 +103,20 @@ class MimicCXRDataset(torch.utils.data.Dataset):
             sent_length = []
 
             sentences = self.sent_tokenizer.tokenize(item.text)
-            sentences = [''] + sentences[:min(len(sentences), self.max_report_length)]
+            sentences = sentences[:min(len(sentences), self.max_report_length)]
             for sentence in sentences:
                 words = self.word_tokenizer.tokenize(sentence)
 
-                num_words = min(len(words), self.max_sentence_length)
-                words = words[:num_words]
+                num_words = min(len(words), self.max_sentence_length - 1) + 1
+                words = words[:num_words - 1] + [Token.eos]
 
                 words = torch.as_tensor((
-                    [self.word_to_index[Token.bos]] +
                     [self.word_to_index.get(word, self.word_to_index[Token.unk]) for word in words] +
-                    [self.word_to_index[Token.eos]] +
                     [self.word_to_index[Token.pad]] * (self.max_sentence_length - num_words)
                 ), dtype=torch.long)
 
                 text.append(words)
-                sent_length.append(num_words + 2)
+                sent_length.append(num_words)
 
             text = torch.stack(text, 0)
             sent_length = torch.as_tensor(sent_length, dtype=torch.long)

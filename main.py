@@ -4,7 +4,6 @@
 # Pretrained models for image embeddings
 # Training time annealing
 # Reinforcement Learning on CIDEr
-# Testing time beam search
 
 import datetime
 import functools
@@ -22,7 +21,6 @@ from absl import flags
 from torch.nn import (
     functional as F,
     DataParallel,
-    Module,
     Embedding,
 )
 
@@ -32,7 +30,12 @@ from mimic_cxr.utils import Log
 from api import Phase
 from api.datasets import MimicCXRDataset
 from api.data_loader import CollateFn
-from api.models import ImageEncoder, ReportDecoder, SentenceDecoder
+from api.models import (
+    Module,
+    ImageEncoder,
+    ReportDecoder,
+    SentenceDecoder,
+)
 from api.utils import (
     SummaryWriter,
     expand_to_sequence,
@@ -48,6 +51,7 @@ from api.utils import (
 flags.DEFINE_string('do', 'main', 'Function to execute (default: "main")')
 flags.DEFINE_string('device', 'cuda', 'GPU device to use (default: "cuda")')
 flags.DEFINE_bool('debug', False, 'Turn on debug mode')
+flags.DEFINE_bool('debug_subsample', False, 'Turn on subsampling for debugging')
 
 """ Image
 """
@@ -69,9 +73,11 @@ flags.DEFINE_float('dropout', 0.5, 'Dropout (default: 0.5)')
 flags.DEFINE_integer('num_workers', 8, 'Number of data loading workers (default: 8)')
 flags.DEFINE_integer('batch_size', 16, 'Batch size (default: 16)')
 flags.DEFINE_integer('num_epochs', 16, 'Number of training epochs (default: 16)')
+flags.DEFINE_integer('save_epochs', 1, 'Number of epochs per model-saving (default: 1)')
 flags.DEFINE_float('lr', None, 'Learning rate')
 flags.DEFINE_integer('log_steps', 10, 'Logging per # steps for numerical values (default: 10)')
 flags.DEFINE_integer('log_text_steps', 100, 'Logging per # steps for text (default: 100)')
+flags.DEFINE_string('ckpt_path', None, 'Checkpoint path to load (default: None)')
 flags.DEFINE_string('working_dir', os.getenv('WORKING_DIR'), 'Working directory (default: $WORKING_DIR)')
 FLAGS = flags.FLAGS
 
@@ -84,39 +90,36 @@ class Model(Module):
         self.report_decoder = ReportDecoder(**kwargs)
         self.sentence_decoder = SentenceDecoder(**kwargs)
 
-    def forward(self, batch):
-        """
+    def _train(self, batch):
+        batch.update(self.image_encoder(batch))
+        batch.update(self.report_decoder._train(batch, length=batch['text_length']))
 
-        Args:
-            image
-            view_position
-            text_length
-            text
-            label
-            stop
-            sent_length
-
-        """
-
-        batch.update(self.image_encoder(batch))  # image
-
-        # Forwarding for Report Level
-        batch.update(self.report_decoder(batch, length=batch['text_length']))  # _label, _topic, _stop, _temp
-
-        # Teacher-forcing for Report Level
-        for key in ['text', 'label', 'stop', 'sent_length']:
-            batch[key] = teacher_sequence(batch[key])
-
-        # Convert to Sentence Level
         for key in ['image', 'view_position']:
-            batch[key] = expand_to_sequence(batch[key], torch.max(batch['text_length'] - 1))
+            batch[key] = expand_to_sequence(batch[key], torch.max(batch['text_length']))
 
         for key in ['image', 'view_position', 'text', 'label', 'stop', 'sent_length', '_label', '_topic', '_stop', '_temp']:
-            batch[key] = pack_padded_sequence(batch[key], batch['text_length'] - 1)
+            batch[key] = pack_padded_sequence(batch[key], batch['text_length'])
+
+        batch.update(self.sentence_decoder._train(batch, length=batch['sent_length']))
+
+        for key in ['text', '_attention', '_log_probability', '_text']:
+            batch[key] = pack_padded_sequence(batch[key], batch['sent_length'])
+
+        return batch
+
+    def _test(self, batch, beam_size=4):
+        batch.update(self.image_encoder(batch))
+        batch.update(self.report_decoder._test(batch))
+        import pdb; pdb.set_trace()
+
+        for key in ['image', 'view_position']:
+            batch[key] = expand_to_sequence(batch[key], torch.max(batch['_text_length']))
+
+        for key in ['image', 'view_position', '_label', '_topic', '_stop', '_temp']:
+            _batch[key] = pack_padded_sequence(batch[key], batch['_text_length'])
 
         # Forwarding for Sentence Level
-        # batch.update(self.sentence_decoder(batch, length=batch['sent_length']))  # _attention, _log_probability
-        _batch = self.sentence_decoder.decode(batch)  # TODO: DEBUG
+        batch.update(self.sentence_decoder._test(batch))
 
         # Teacher-forcing for Sentence Level
         for key in ['text']:
@@ -149,6 +152,9 @@ def main():
 
     train_df = df[df.subject_id.isin(mimic_cxr.train_subject_ids)]
     test_df = df[df.subject_id.isin(mimic_cxr.test_subject_ids)]
+
+    if FLAGS.debug_subsample:
+        train_df = train_df.iloc[:int(0.001 * len(train_df))]
 
     Dataset = functools.partial(
         MimicCXRDataset,
@@ -189,17 +195,27 @@ def main():
         'label_size': 16,  # TODO(stmharry)
     })
     model = Model(**kwargs)
-    model.sentence_decoder.word_embedding = Embedding.from_pretrained(torch.from_numpy(train_dataset.word_embedding))
-
+    model.sentence_decoder.word_embedding = Embedding.from_pretrained(torch.from_numpy(train_dataset.word_embedding), freeze=False)
     model = DataParallel(model).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=FLAGS.lr)
-    logger.info(model)
 
-    working_dir = os.path.join(FLAGS.working_dir, datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S-%f'))
+    if FLAGS.ckpt_path:
+        logger.info(f'Loading model from {FLAGS.ckpt_path}')
+
+        model.load_state_dict(state_dict = torch.load(FLAGS.ckpt_path))
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=FLAGS.lr)
+    logger.info(f'model info:\n{model}')
+
+    if FLAGS.debug:
+        working_dir = os.path.join(FLAGS.working_dir, 'debug')
+    else:
+        working_dir = FLAGS.working_dir
+
+    working_dir = os.path.join(working_dir, datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S-%f'))
     os.makedirs(working_dir)
     with open(os.path.join(working_dir, 'meta.json'), 'w') as f:
         json.dump(kwargs, f, indent=4)
-
+    torch.save(model, os.path.join(working_dir, f'model-epoch-0.pth'))
     writer = SummaryWriter(working_dir)
 
     """ Training Loop
@@ -228,18 +244,16 @@ def main():
                     batch[key] = value.to(device)
 
                 if phase == Phase.train:
-                    batch = model.forward(batch)
+                    batch = model(batch, phase=phase)
                 elif phase == Phase.test:
                     with torch.no_grad():
-                        batch = model.decode(batch)
+                        batch = model(batch, phase=phase)
 
                 losses = {
                     'stop_bce': F.binary_cross_entropy(batch['_stop'], batch['stop']),
                     'word_ce': F.nll_loss(batch['_log_probability'], batch['text']),
                 }
-                metrics = {
-                    'word_perplexity': torch.exp(losses['word_ce']),
-                }
+                metrics = {}
 
                 if phase == Phase.train:
                     total_loss = sum(losses.values())
@@ -259,7 +273,7 @@ def main():
                         writer.add_log(_log, prefix=phase, global_step=num_step)
 
                     if num_step % FLAGS.log_text_steps == 0:
-                        text_length_in_words = pad_packed_sequence(batch['sent_length'] - 1, batch['text_length'] - 1).sum(1)
+                        text_length_in_words = pad_packed_sequence(batch['sent_length'], batch['text_length']).sum(1)
                         texts = batch['text'].split(text_length_in_words.tolist())
                         _texts = batch['_text'].split(text_length_in_words.tolist())
 
@@ -268,6 +282,9 @@ def main():
 
             if phase == Phase.test:
                 writer.add_log(log, prefix=phase, global_step=num_step)
+
+        if (num_epoch + 1) % FLAGS.save_epochs == 0:
+            torch.save(model.state_dict(), os.path.join(working_dir, f'model-epoch-{num_epoch}.pth'))
 
     writer.close()
 
