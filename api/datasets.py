@@ -125,6 +125,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
                     st.add(lv2)
                 cat_vec = mlb.transform([st]).flatten()
                 category.append(cat_vec)
+                print(category)
             labels.append(torch.as_tensor(category, dtype=torch.float))
         torch.save(labels, self._labels_path(field=field))
 
