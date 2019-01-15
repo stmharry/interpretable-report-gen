@@ -126,7 +126,6 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         lst = [st]
         mlb.fit_transform(lst)
         sentence_categories_df.columns = pd.MultiIndex.from_tuples(cols_fixed)
-        # Check if sentence_categories_df is mutable
         return mlb
 
     def _word_embedding_path(self, field):
