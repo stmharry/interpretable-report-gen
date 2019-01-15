@@ -234,7 +234,7 @@ def main():
                         batch = model.decode(batch)
 
                 losses = {
-                    # 'label_ce': F.binary_cross_entropy(batch['_label'], batch['label']),
+                    'label_ce': F.binary_cross_entropy(batch['_label'], batch['label']),
                     'stop_bce': F.binary_cross_entropy(batch['_stop'], batch['stop']),
                     'word_ce': F.nll_loss(batch['_log_probability'], batch['text']),
                 }
