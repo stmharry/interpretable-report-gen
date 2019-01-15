@@ -4,7 +4,6 @@ class Phase:
 
     __all__ = [train, test]
 
-
 class Token:
     pad = '<pad>'
     unk = '<unk>'

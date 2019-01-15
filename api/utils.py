@@ -1,5 +1,9 @@
+import logging
 import tensorboardX
 import torch
+
+_logger = logging.getLogger(__name__)
+
 
 """ RNN
 """
@@ -62,6 +66,7 @@ class SummaryWriter(tensorboardX.SummaryWriter):
         self.add_text(f'{prefix}/{name}', log_text, global_step=global_step)
 
 
-def print_batch(batch):
+def print_batch(batch, logger=None):
+    logger = logger or _logger
     for (key, value) in batch.items():
-        print((key, value.shape))
+        logger.debug(f'{key}: shape={value.shape}')
