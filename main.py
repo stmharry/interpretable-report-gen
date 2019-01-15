@@ -1,5 +1,4 @@
 """ TODO """
-# Train all from scratch
 # Pretrain w/ label then train
 # Pretrained models for image embeddings
 # Training time annealing
@@ -110,24 +109,18 @@ class Model(Module):
     def _test(self, batch, beam_size=4):
         batch.update(self.image_encoder(batch))
         batch.update(self.report_decoder._test(batch))
-        import pdb; pdb.set_trace()
 
         for key in ['image', 'view_position']:
             batch[key] = expand_to_sequence(batch[key], torch.max(batch['_text_length']))
 
         for key in ['image', 'view_position', '_label', '_topic', '_stop', '_temp']:
-            _batch[key] = pack_padded_sequence(batch[key], batch['_text_length'])
+            batch[key] = pack_padded_sequence(batch[key], batch['_text_length'])
 
-        # Forwarding for Sentence Level
         batch.update(self.sentence_decoder._test(batch))
+        import pdb; pdb.set_trace()
 
-        # Teacher-forcing for Sentence Level
-        for key in ['text']:
-            batch[key] = teacher_sequence(batch[key])
-
-        # Convert to Word Level
         for key in ['text', '_attention', '_log_probability', '_text']:
-            batch[key] = pack_padded_sequence(batch[key], batch['sent_length'] - 1)
+            batch[key] = pack_padded_sequence(batch[key], batch['sent_length'])
 
         return batch
 
@@ -190,6 +183,7 @@ def main():
 
     kwargs = FLAGS.flag_values_dict()
     kwargs.update({
+        'index_to_word': train_dataset.index_to_word,
         'word_to_index': train_dataset.word_to_index,
         'view_position_size': train_dataset.num_view_position,
         'label_size': 16,  # TODO(stmharry)
@@ -197,14 +191,12 @@ def main():
     model = Model(**kwargs)
     model.sentence_decoder.word_embedding = Embedding.from_pretrained(torch.from_numpy(train_dataset.word_embedding), freeze=False)
     model = DataParallel(model).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=FLAGS.lr)
+    logger.info(f'Model info:\n{model}')
 
     if FLAGS.ckpt_path:
         logger.info(f'Loading model from {FLAGS.ckpt_path}')
-
-        model.load_state_dict(state_dict = torch.load(FLAGS.ckpt_path))
-
-    optimizer = torch.optim.Adam(model.parameters(), lr=FLAGS.lr)
-    logger.info(f'model info:\n{model}')
+        model.load_state_dict(torch.load(FLAGS.ckpt_path))
 
     if FLAGS.debug:
         working_dir = os.path.join(FLAGS.working_dir, 'debug')
