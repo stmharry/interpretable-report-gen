@@ -106,6 +106,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
                 words = words[:num_words]
 
                 new_sentence = ''.join(words)
+                print(new_sentence)
 
                 # categories = self._sentence_labeler(new_sentence, sentence_categories_df)
                 punct_to_remove = ''.join([x for x in string.punctuation if x != '-'])
@@ -253,7 +254,6 @@ class MimicCXRDataset(torch.utils.data.Dataset):
 
             # TODO(stmharry): really load label
             label = self.labels[index]
-            print(label)
             # label = torch.ones((text_length, 16), dtype=torch.float)
 
             num = torch.arange(text_length, dtype=torch.long).unsqueeze(1)
