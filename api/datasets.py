@@ -67,11 +67,11 @@ class MimicCXRDataset(torch.utils.data.Dataset):
 
         word_vectors = KeyedVectors.load(self._word_embedding_path(field=field))
 
-        self.index_to_word = word_vectors.index2entity + [Token.unk, Token.pad]
+        self.index_to_word = word_vectors.index2entity + [Token.unk]
         self.word_to_index = dict(zip(self.index_to_word, range(len(self.index_to_word))))
         self.word_embedding = np.concatenate([
             word_vectors.vectors,
-            np.zeros((2, embedding_size)),
+            np.zeros((1, embedding_size)),
         ], axis=0).astype(np.float32)
 
         # TODO(stmharry): ColorJitter
@@ -108,11 +108,10 @@ class MimicCXRDataset(torch.utils.data.Dataset):
                 words = self.word_tokenizer.tokenize(sentence)
 
                 num_words = min(len(words), self.max_sentence_length - 1) + 1
-                words = words[:num_words - 1] + [Token.eos]
-
                 words = torch.as_tensor((
-                    [self.word_to_index.get(word, self.word_to_index[Token.unk]) for word in words] +
-                    [self.word_to_index[Token.pad]] * (self.max_sentence_length - num_words)
+                    [self.word_to_index.get(word, self.word_to_index[Token.unk]) for word in words[:num_words - 1]] +
+                    [self.word_to_index[Token.eos]] +
+                    [0] * (self.max_sentence_length - num_words)
                 ), dtype=torch.long)
 
                 text.append(words)
@@ -123,7 +122,8 @@ class MimicCXRDataset(torch.utils.data.Dataset):
             text_length = torch.as_tensor(sent_length.numel(), dtype=torch.long)
 
             # TODO(stmharry): really load label
-            label = torch.ones((text_length, 16), dtype=torch.float)
+            # label = torch.ones((text_length, 16), dtype=torch.float)
+            label = torch.arange(1, 1 + text_length, dtype=torch.float).unsqueeze(1).expand(-1, 16)
 
             num = torch.arange(text_length, dtype=torch.long).unsqueeze(1)
             stop = torch.as_tensor(num == text_length - 1, dtype=torch.float)

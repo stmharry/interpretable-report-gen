@@ -165,6 +165,7 @@ class ReportDecoder(Module):
         h = torch.tanh(self.fc_h(self.dropout(image_mean)))
         m = torch.tanh(self.fc_m(self.dropout(image_mean)))
 
+        begin = torch.ones((batch_size, 1), dtype=torch.float).cuda()
         this_label = torch.zeros((batch_size, self.label_size), dtype=torch.float).cuda()
 
         outputs = []
@@ -176,7 +177,7 @@ class ReportDecoder(Module):
             _batch = self._step({
                 'image_mean': image_mean[:batch_size_t],
                 'view_position': view_position[:batch_size_t],
-                'begin': torch.full((batch_size_t, 1), t == 0, dtype=torch.float).cuda(),
+                'begin': begin[:batch_size_t],
                 'label': this_label[:batch_size_t],
                 'h': h[:batch_size_t],
                 'm': m[:batch_size_t],
@@ -185,6 +186,7 @@ class ReportDecoder(Module):
             h = _batch['h']
             m = _batch['m']
 
+            begin = torch.zeros((batch_size, 1), dtype=torch.float).cuda()
             this_label = label[:, t]
 
             outputs.append({key: _batch[key] for key in ['_label', '_topic', '_stop', '_temp']})
@@ -298,6 +300,7 @@ class SentenceDecoder(Module):
 
         self.image_size          = kwargs['image_size']
         self.view_position_size  = kwargs['view_position_size']
+        self.index_to_word       = kwargs['index_to_word']
         self.word_to_index       = kwargs['word_to_index']
         self.label_size          = kwargs['label_size']
         self.embedding_size      = kwargs['embedding_size']
@@ -420,7 +423,7 @@ class SentenceDecoder(Module):
             h = _batch['h']
             m = _batch['m']
 
-            this_text_embegging = text_embedding[:, t]
+            this_text_embedding = text_embedding[:, t]
 
             outputs.append({key: _batch[key] for key in ['_attention', '_log_probability', '_text']})
 
@@ -446,7 +449,7 @@ class SentenceDecoder(Module):
 
         image         = batch['image']
         view_position = batch['view_position']
-        label         = batch['label']
+        label         = batch['_label']
         topic         = batch['_topic']
         temp          = batch['_temp']
 
@@ -461,7 +464,7 @@ class SentenceDecoder(Module):
         _this_text = torch.full((batch_size * beam_size,), self.word_to_index[Token.bos], dtype=torch.long).cuda()
 
         _text = torch.zeros((batch_size * beam_size, 0), dtype=torch.long).cuda()
-        _sum_log_probability = torch.zeros((batch_size * beam_size, 1), dtype=torch.float).cuda()
+        _sum_log_probability = torch.zeros((batch_size * beam_size,), dtype=torch.float).cuda()
 
         outputs = []
         for t in range(self.max_sentence_length):
@@ -471,15 +474,13 @@ class SentenceDecoder(Module):
 
             logger.debug(f'SentenceDecoder.decode(): time_step={t}, num_sentences={batch_size_t}')
 
-            _this_text_embedding = self.word_embedding(_this_text)
-
             _batch = self._step({
                 'image_mean': image_mean[batch_index],
                 'view_position': view_position[batch_index],
                 'label': label[batch_index],
                 'topic': topic[batch_index],
                 'temp': temp[batch_index],
-                'text_embedding': _this_text_embedding,
+                'text_embedding': self.word_embedding(_this_text),
                 'image': image[batch_index],
                 'v': v[batch_index],
                 'h': h,
@@ -491,16 +492,15 @@ class SentenceDecoder(Module):
             _attention = _batch['_attention']
             _log_probability = _batch['_log_probability']
 
-            _log_probability = _sum_log_probability + _log_probability
+            _log_probability = _sum_log_probability.unsqueeze(1) + _log_probability
             _log_probability = pad_packed_sequence(_log_probability, batch_length, padding_value=float('-inf'))
-            (_sum_log_probability, _top_index) = _log_probability.view(batch_size, -1, 1).topk(beam_size, 1)
+            if t == 0:  # At t = 0, there is only one beam
+                _log_probability = _log_probability.narrow(1, 0, 1)
+            (_sum_log_probability, _top_index) = _log_probability.view(batch_size, -1).topk(beam_size, 1)
 
             _sum_log_probability = pack_padded_sequence(_sum_log_probability, batch_length)
-            _index = pack_padded_sequence(_top_index / self.vocab_size + batch_begin.view(-1, 1, 1), batch_length).squeeze(1)
+            _index = pack_padded_sequence(_top_index / self.vocab_size + batch_begin.view(-1, 1), batch_length)
             _this_text = pack_padded_sequence(_top_index % self.vocab_size, batch_length)
-
-            """ DEBUG """
-            _this_text[-1] = self.word_to_index[Token.eos]
 
             if t == self.max_sentence_length:
                 _this_text = torch.full((batch_size_t,), self.word_to_index[Token.eos], dtype=torch.long).cuda()
@@ -512,7 +512,7 @@ class SentenceDecoder(Module):
                 output = {
                     '_index': batch_index[is_end].unsqueeze(1),
                     '_attention': _attention[is_end],
-                    '_log_probability': _sum_log_probability[is_end],
+                    '_log_probability': _sum_log_probability[is_end].unsqueeze(1),
                     '_text': _text[is_end],
                 }
                 outputs.extend([dict(zip(output.keys(), values)) for values in zip(*output.values())])
