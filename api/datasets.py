@@ -54,16 +54,16 @@ class MimicCXRDataset(torch.utils.data.Dataset):
     '''
     def _sentence_labels_regex_path(self):
         return os.path.join(os.getenv('CACHE_DIR'), 'Sentence Labeling Categories - Categories.csv')
-    
+
     def _labels_path(self, field):
         return os.path.join(os.getenv('CACHE_DIR'), f'sentence-labels-{field}.pt')
 
     def _labels_map_path(self, field):
         return os.path.join(os.getenv('CACHE_DIR'), f'sentence-labels-map-{field}.pt')
-    
+
     def _read_categories_df(self):
         return pd.read_csv(self._sentence_labels_regex_path(),header=[0, 1])
-    
+
     def _sentence_labeler(self, s, sentence_categories_df):
         punct_to_remove = ''.join([x for x in string.punctuation if x != '-'])
         s = s.translate(punct_to_remove).lower()
@@ -75,7 +75,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
                     categories.append(col)
                     break
         return categories
-    
+
     def _make_labels(self, field):
         sentence_categories_df = self._read_categories_df()
         mlb = self._fit_binarizer(sentence_categories_df)
@@ -100,7 +100,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
                     st.add(lv2)
                 cat_vec = mlb.transform([st]).flatten()
                 category.append(cat_vec)
-                
+
             labels.append(torch.as_tensor(category, dtype=torch.float))
         torch.save(labels, self._labels_path(field=field))
         torch.save(mlb.classes_, self._labels_map_path(field=field))
@@ -115,7 +115,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         st = set()
         last_lvl1 = None
         for (lvl1, lvl2) in cols:
-            if lvl1.startswith('Unnamed'): 
+            if lvl1.startswith('Unnamed'):
                 st.add(lvl2)
                 cols_fixed.append((last_lvl1, lvl2))
             else:
@@ -171,11 +171,11 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         self.labels = torch.load(self._labels_path(field=field))
 
 
-        self.index_to_word = word_vectors.index2entity + [Token.unk, Token.pad]
+        self.index_to_word = word_vectors.index2entity + [Token.unk]
         self.word_to_index = dict(zip(self.index_to_word, range(len(self.index_to_word))))
         self.word_embedding = np.concatenate([
             word_vectors.vectors,
-            np.zeros((2, embedding_size)),
+            np.zeros((1, embedding_size)),
         ], axis=0).astype(np.float32)
 
         # TODO(stmharry): ColorJitter
@@ -198,6 +198,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         view_position = torch.as_tensor(view_position, dtype=torch.float)
 
         _item = {
+            'item_index': index,
             'image': image,
             'view_position': view_position,
         }
@@ -207,30 +208,25 @@ class MimicCXRDataset(torch.utils.data.Dataset):
             sent_length = []
 
             sentences = self.sent_tokenizer.tokenize(item.text)
-            sentences = [''] + sentences[:min(len(sentences), self.max_report_length)]
+            sentences = sentences[:min(len(sentences), self.max_report_length)]
             for sentence in sentences:
                 words = self.word_tokenizer.tokenize(sentence)
 
-                num_words = min(len(words), self.max_sentence_length)
-                words = words[:num_words]
-
+                num_words = min(len(words), self.max_sentence_length - 1) + 1
                 words = torch.as_tensor((
-                    [self.word_to_index[Token.bos]] +
-                    [self.word_to_index.get(word, self.word_to_index[Token.unk]) for word in words] +
+                    [self.word_to_index.get(word, self.word_to_index[Token.unk]) for word in words[:num_words - 1]] +
                     [self.word_to_index[Token.eos]] +
-                    [self.word_to_index[Token.pad]] * (self.max_sentence_length - num_words)
+                    [0] * (self.max_sentence_length - num_words)
                 ), dtype=torch.long)
 
                 text.append(words)
-                sent_length.append(num_words + 2)
-        
+                sent_length.append(num_words)
+
             text = torch.stack(text, 0)
             sent_length = torch.as_tensor(sent_length, dtype=torch.long)
             text_length = torch.as_tensor(sent_length.numel(), dtype=torch.long)
 
-            # TODO(stmharry): really load label
             label = self.labels[index]
-            # label = torch.ones((text_length, 16), dtype=torch.float)
 
             num = torch.arange(text_length, dtype=torch.long).unsqueeze(1)
             stop = torch.as_tensor(num == text_length - 1, dtype=torch.float)
