@@ -5,6 +5,10 @@ import torch
 _logger = logging.getLogger(__name__)
 
 
+def to_numpy(tensor):
+    return tensor.detach().cpu().numpy()
+
+
 """ RNN
 """
 
@@ -23,26 +27,6 @@ def pad_packed_sequence(tensor, lengths, padding_value=0):
     sequences = tensor.split(lengths.tolist(), 0)
 
     return torch.nn.utils.rnn.pad_sequence(sequences, batch_first=True, padding_value=padding_value)
-
-
-def teacher_sequence(tensor):
-    return tensor[:, 1:]
-
-
-def length_sorted_rnn(use_fields=None):
-    use_fields = use_fields or []
-
-    def _length_sorted_rnn(func):
-        def _func(self, batch, length):
-            index = length.argsort(descending=True)
-            _index = index.argsort()
-
-            batch = func(self, {key: batch[key][index] for key in use_fields}, length[index])
-            return {key: batch[key][_index] for key in batch.keys()}
-
-        return _func
-
-    return _length_sorted_rnn
 
 
 """ Log
@@ -69,4 +53,4 @@ class SummaryWriter(tensorboardX.SummaryWriter):
 def print_batch(batch, logger=None):
     logger = logger or _logger
     for (key, value) in batch.items():
-        logger.debug(f'{key}: shape={value.shape}')
+        logger.info(f'{key}: shape={value.shape}')
