@@ -94,6 +94,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         view_position = torch.as_tensor(view_position, dtype=torch.float)
 
         _item = {
+            'item_index': index,
             'image': image,
             'view_position': view_position,
         }
@@ -122,8 +123,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
             text_length = torch.as_tensor(sent_length.numel(), dtype=torch.long)
 
             # TODO(stmharry): really load label
-            # label = torch.ones((text_length, 16), dtype=torch.float)
-            label = torch.arange(1, 1 + text_length, dtype=torch.float).unsqueeze(1).expand(-1, 16)
+            label = torch.full((text_length, 16), 0.5, dtype=torch.float)
 
             num = torch.arange(text_length, dtype=torch.long).unsqueeze(1)
             stop = torch.as_tensor(num == text_length - 1, dtype=torch.float)

@@ -11,7 +11,6 @@ from torch.nn import (
     Linear,
     Dropout,
 )
-
 from torchvision.models.resnet import (
     ResNet,
     Bottleneck,
@@ -19,7 +18,6 @@ from torchvision.models.resnet import (
 
 from api import Phase, Token
 from api.utils import (
-    length_sorted_rnn,
     pack_padded_sequence,
     pad_packed_sequence,
     print_batch,
@@ -30,6 +28,22 @@ logger = logging.getLogger(__name__)
 if 'profile' not in dir(__builtins__):
     def profile(func):
         return func
+
+
+def length_sorted_rnn(use_fields=None):
+    use_fields = use_fields or []
+
+    def _length_sorted_rnn(func):
+        def _func(self, batch, length, **kwargs):
+            index = length.argsort(descending=True)
+            _index = index.argsort()
+
+            batch = func(self, {key: batch[key][index] for key in use_fields}, length[index], **kwargs)
+            return {key: batch[key][_index] for key in batch.keys()}
+
+        return _func
+
+    return _length_sorted_rnn
 
 
 class Module(_Module):
@@ -138,7 +152,7 @@ class ReportDecoder(Module):
 
     @length_sorted_rnn(use_fields=['image', 'view_position', 'label'])
     @profile
-    def _train(self, batch, length):
+    def _train(self, batch, length, teacher_forcing_ratio=1.0):
         """
 
         Args:
@@ -183,11 +197,17 @@ class ReportDecoder(Module):
                 'm': m[:batch_size_t],
             })
 
-            h = _batch['h']
-            m = _batch['m']
+            (h, m, _label) = [
+                _batch[key]
+                for key in ['h', 'm', '_label']
+            ]
 
-            begin = torch.zeros((batch_size, 1), dtype=torch.float).cuda()
-            this_label = label[:, t]
+            begin = torch.zeros((batch_size_t, 1), dtype=torch.float).cuda()
+            this_label = torch.where(
+                torch.rand((batch_size_t, 1), dtype=torch.float).cuda() < teacher_forcing_ratio,
+                label[:batch_size_t, t],
+                _label,
+            )
 
             outputs.append({key: _batch[key] for key in ['_label', '_topic', '_stop', '_temp']})
 
@@ -250,10 +270,6 @@ class ReportDecoder(Module):
                 for key in ['h', 'm', '_label', '_topic', '_stop', '_temp']
             ]
 
-            """ DEBUG """
-            # _this_stop = torch.full((batch_size_t, 1), 0.0, dtype=torch.float).cuda()
-            # _this_stop[-1] = 1.0
-
             if t == self.max_report_length:
                 _this_stop = torch.full((batch_size_t, 1), 1.0, dtype=torch.float).cuda()
 
@@ -285,6 +301,7 @@ class ReportDecoder(Module):
 
         outputs = {key: torch.nn.utils.rnn.pad_sequence([output[key] for output in outputs], batch_first=True) for key in outputs[0].keys()}
 
+        # Index the beams
         _index = outputs['_index'].squeeze(1).argsort(0)
         outputs = {key: value[_index] for (key, value) in outputs.items()}
 
@@ -322,7 +339,10 @@ class SentenceDecoder(Module):
             self.embedding_size,      # text
         ]
         self.lstm_cell = LSTMCell(sum(self.lstm_sizes), self.hidden_size)
-        self.fc_sizes = [self.embedding_size, self.embedding_size]  # hidden, sentinel
+        self.fc_sizes = [
+            self.embedding_size,  # hidden
+            self.embedding_size,  # sentinel
+        ]
         self.fc = Linear(self.hidden_size, sum(self.fc_sizes))
         self.fc_hh = Linear(self.embedding_size, self.hidden_size)
         self.fc_s = Linear(self.embedding_size, self.hidden_size)
@@ -331,12 +351,13 @@ class SentenceDecoder(Module):
         self.dropout = Dropout(self.dropout)
 
     def _step(self, batch):
+        text_embedding = self.word_embedding(batch['text'])
         x = torch.cat([
             self.dropout(batch['image_mean']),
             batch['view_position'],
             batch['label'],
             self.dropout(batch['topic']),
-            self.dropout(batch['text_embedding']),
+            self.dropout(text_embedding),
         ], 1)
 
         (h, m) = self.lstm_cell(x, (batch['h'], batch['m']))
@@ -364,8 +385,7 @@ class SentenceDecoder(Module):
 
     @length_sorted_rnn(use_fields=['image', 'view_position', 'text', 'label', '_topic', '_temp'])
     @profile
-    def _train(self, batch, length):
-
+    def _train(self, batch, length, teacher_forcing_ratio=1.0):
         """
 
         Args:
@@ -392,14 +412,12 @@ class SentenceDecoder(Module):
 
         batch_size = len(image)
 
-        text_embedding = self.word_embedding(text)
         image_mean = image.mean(1)
         v = self.fc_v(self.dropout(image))
         h = torch.tanh(self.fc_h(self.dropout(image_mean)))
         m = torch.tanh(self.fc_m(self.dropout(image_mean)))
 
         this_text = torch.full((batch_size,), self.word_to_index[Token.bos], dtype=torch.long).cuda()
-        this_text_embedding = self.word_embedding(this_text)
 
         outputs = []
         for t in range(torch.max(length)):
@@ -413,17 +431,23 @@ class SentenceDecoder(Module):
                 'label': label[:batch_size_t],
                 'topic': topic[:batch_size_t],
                 'temp': temp[:batch_size_t],
-                'text_embedding': this_text_embedding[:batch_size_t],
+                'text': this_text[:batch_size_t],
                 'image': image[:batch_size_t],
                 'v': v[:batch_size_t],
                 'h': h[:batch_size_t],
                 'm': m[:batch_size_t],
             })
 
-            h = _batch['h']
-            m = _batch['m']
+            (h, m, _text) = [
+                _batch[key]
+                for key in ['h', 'm', '_text']
+            ]
 
-            this_text_embedding = text_embedding[:, t]
+            this_text = torch.where(
+                torch.rand((batch_size_t,), dtype=torch.float).cuda() < teacher_forcing_ratio,
+                text[:batch_size_t, t],
+                _text,
+            )
 
             outputs.append({key: _batch[key] for key in ['_attention', '_log_probability', '_text']})
 
@@ -432,8 +456,7 @@ class SentenceDecoder(Module):
         return outputs
 
     @profile
-    def _test(self, batch, beam_size=4):
-
+    def _test(self, batch, beam_size=4, alpha=0.65, beta=5.0):
         """
 
         Args:
@@ -444,6 +467,9 @@ class SentenceDecoder(Module):
             temp (batch_size,): Temperature parameters.
 
         Returns:
+            _attention (batch_size, max_length, image_size * image_size + 1): Attention weights.
+            _log_probability (batch_size, max_length, vocab_size): Generated probability on words.
+            _text (batch_size, max_length): Generated sentences.
 
         """
 
@@ -480,17 +506,18 @@ class SentenceDecoder(Module):
                 'label': label[batch_index],
                 'topic': topic[batch_index],
                 'temp': temp[batch_index],
-                'text_embedding': self.word_embedding(_this_text),
+                'text': _this_text,
                 'image': image[batch_index],
                 'v': v[batch_index],
                 'h': h,
                 'm': m,
             })
 
-            h = _batch['h']
-            m = _batch['m']
-            _attention = _batch['_attention']
-            _log_probability = _batch['_log_probability']
+            (h, m, _attention, _log_probability) = [
+                _batch[key]
+                for key in ['h', 'm', '_attention', '_log_probability']
+            ]
+
 
             _log_probability = _sum_log_probability.unsqueeze(1) + _log_probability
             _log_probability = pad_packed_sequence(_log_probability, batch_length, padding_value=float('-inf'))
@@ -506,14 +533,17 @@ class SentenceDecoder(Module):
                 _this_text = torch.full((batch_size_t,), self.word_to_index[Token.eos], dtype=torch.long).cuda()
 
             _text = torch.cat([_text[_index], _this_text.unsqueeze(1)], 1)
+            _length = torch.full((batch_size_t, 1), t + 1, dtype=torch.long).cuda()
 
             is_end = (_this_text == self.word_to_index[Token.eos])
             if is_end.any():
                 output = {
                     '_index': batch_index[is_end].unsqueeze(1),
                     '_attention': _attention[is_end],
+                    '_score': _sum_log_probability[is_end].unsqueeze(1) / ((beta + t) ** alpha / (beta + 1) ** alpha),  # https://arxiv.org/pdf/1609.08144.pdf
                     '_log_probability': _sum_log_probability[is_end].unsqueeze(1),
                     '_text': _text[is_end],
+                    '_sent_length': _length[is_end],
                 }
                 outputs.extend([dict(zip(output.keys(), values)) for values in zip(*output.values())])
 
@@ -527,15 +557,19 @@ class SentenceDecoder(Module):
 
         outputs = {key: torch.nn.utils.rnn.pad_sequence([output[key] for output in outputs], batch_first=True) for key in outputs[0].keys()}
 
+        # Index the beams
         _index = outputs['_index'].squeeze(1).argsort(0)
         outputs = {key: value[_index].view(batch_size, beam_size, -1) for (key, value) in outputs.items()}
 
-        _index = outputs['_log_probability'].argsort(1, descending=True)
+        # Sort beams internally by scores
+        _index = outputs['_score'].argsort(1, descending=True)
         batch_begin = torch.arange(0, batch_size * beam_size, beam_size).view(-1, 1, 1).cuda()
         _index = (_index + batch_begin).view(-1)
         outputs = {key: value.view(batch_size * beam_size, -1)[_index].view(batch_size, beam_size, -1) for (key, value) in outputs.items()}
 
         outputs.pop('_index')
-        import pdb; pdb.set_trace()
+        outputs['_score'] = outputs['_score'].squeeze(2)
+        outputs['_log_probability'] = outputs['_log_probability'].squeeze(2)
+        outputs['_sent_length'] = outputs['_sent_length'].squeeze(2)
 
         return outputs
