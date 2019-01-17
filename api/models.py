@@ -206,7 +206,7 @@ class ReportDecoder(Module):
             this_label = torch.where(
                 torch.rand((batch_size_t, 1), dtype=torch.float).cuda() < teacher_forcing_ratio,
                 label[:batch_size_t, t],
-                _label,
+                (_label > 0.5).float(),
             )
 
             outputs.append({key: _batch[key] for key in ['_label', '_topic', '_stop', '_temp']})
@@ -270,7 +270,8 @@ class ReportDecoder(Module):
                 for key in ['h', 'm', '_label', '_topic', '_stop', '_temp']
             ]
 
-            if t == self.max_report_length:
+            _this_label = (_this_label > 0.5).float()
+            if t == self.max_report_length - 1:
                 _this_stop = torch.full((batch_size_t, 1), 1.0, dtype=torch.float).cuda()
 
             _label = torch.cat([_label, _this_label.unsqueeze(1)], 1)
@@ -529,7 +530,7 @@ class SentenceDecoder(Module):
             _index = pack_padded_sequence(_top_index / self.vocab_size + batch_begin.view(-1, 1), batch_length)
             _this_text = pack_padded_sequence(_top_index % self.vocab_size, batch_length)
 
-            if t == self.max_sentence_length:
+            if t == self.max_sentence_length - 1:
                 _this_text = torch.full((batch_size_t,), self.word_to_index[Token.eos], dtype=torch.long).cuda()
 
             _text = torch.cat([_text[_index], _this_text.unsqueeze(1)], 1)
