@@ -1,12 +1,13 @@
+import joblib
 import numpy as np
 import os
+import pandas as pd
 import PIL.Image
 import torch
 import torch.utils.data
 import tqdm
 import re
 import string
-import pandas as pd
 
 from gensim.models import Word2Vec, KeyedVectors
 from nltk.tokenize.punkt import PunktSentenceTokenizer
@@ -38,95 +39,37 @@ class MimicCXRDataset(torch.utils.data.Dataset):
                     [Token.eos]
                 )
 
-    '''
-    def _wordmap_path(self, field):
-        return os.path.join(os.getenv('CACHE_DIR'), f'wordmap-field-{field}.csv')
+    def _sentence_label_path(self, field):
+        return os.path.join(os.getenv('CACHE_DIR'), f'sentence-label-field-{field}.tsv')
 
-    def _make_wordmap(self, field):
-        counter = {}
-        for sentence in self._iterate_sentences():
-            for word in sentence:
-                counter[word] = counter.get(word, 0) + 1
+    def _make_sentence_label(self, field):
+        df = self.df.drop_duplicates('rad_id')[['rad_id', 'text']]
 
-        df = pd.DataFrame(list(counter.items()), columns=['word', 'word_count'])
-        df = df.set_index('word').sort_values('word_count', ascending=False)
-        df.to_csv(self._wordmap_path(field=field))
-    '''
-    def _sentence_labels_regex_path(self):
-        return os.path.join(os.getenv('CACHE_DIR'), 'Sentence Labeling Categories - Categories.csv')
+        df_regex_path = os.path.join(os.path.dirname(__file__), os.pardir, 'data', 'labels.tsv')
+        df_regex = pd.read_csv(df_regex_path, delimiter='\t')
+        regexes = df_regex.groupby('label', sort=False)['regex'].aggregate('|'.join)
 
-    def _labels_path(self, field):
-        return os.path.join(os.getenv('CACHE_DIR'), f'sentence-labels-{field}.pt')
-
-    def _labels_map_path(self, field):
-        return os.path.join(os.getenv('CACHE_DIR'), f'sentence-labels-map-{field}.pt')
-
-    def _read_categories_df(self):
-        return pd.read_csv(self._sentence_labels_regex_path(),header=[0, 1])
-
-    def _sentence_labeler(self, s, sentence_categories_df):
-        punct_to_remove = ''.join([x for x in string.punctuation if x != '-'])
-        s = s.translate(punct_to_remove).lower()
-        categories = []
-        for col in sentence_categories_df.columns.tolist():
-            regex_set = set(['(^|\s)%s($|\s)' % x for x in sentence_categories_df[col] if type(x) is str])
-            for r in regex_set:
-                if len(re.findall(r, s)) > 0:
-                    categories.append(col)
-                    break
-        return categories
-
-    def _make_labels(self, field):
-        sentence_categories_df = self._read_categories_df()
-        mlb = self._fit_binarizer(sentence_categories_df)
-        labels = []
-        for index in range(len(self.df)):
-            item = self.df.iloc[index]
-            category = []
-
+        _dfs = []
+        for item in tqdm.tqdm(df.itertuples(), total=len(df)):
             sentences = self.sent_tokenizer.tokenize(item.text)
-            sentences = [''] + sentences[:min(len(sentences), self.max_report_length)]
-            for sentence in sentences:
-                words = self.word_tokenizer.tokenize(sentence)
+            sentences = sentences[:min(len(sentences), self.max_report_length)]
+            sentences = pd.Series(sentences, name='sentence')
 
-                num_words = min(len(words), self.max_sentence_length)
-                words = words[:num_words]
+            _series = []
+            _series.append(pd.Series([item.rad_id] * len(sentences), name='rad_id'))
 
-                new_sentence = ' '.join(words)
+            for label in regexes.index:
+                _series.append(pd.Series(
+                    1 - sentences.str.extract(r'(\b)({})(\b)'.format(regexes[label])).isnull().all(axis=1).astype(np.int),
+                    name=f'label_{label}',
+                ))
 
-                categories = self._sentence_labeler(new_sentence, sentence_categories_df)
-                st = set()
-                for (lv1, lv2) in categories:
-                    st.add(lv2)
-                cat_vec = mlb.transform([st]).flatten()
-                category.append(cat_vec)
+            _series.append(sentences)
 
-            labels.append(torch.as_tensor(category, dtype=torch.float))
-        torch.save(labels, self._labels_path(field=field))
-        torch.save(mlb.classes_, self._labels_map_path(field=field))
+            _dfs.append(pd.concat(_series, axis=1))
 
-    def _fit_binarizer(self, sentence_categories_df):
-        '''
-        transform categories into 1D vec and prepare for regex
-        '''
-        cols = sentence_categories_df.columns.tolist()
-        mlb = MultiLabelBinarizer()
-        cols_fixed = []
-        st = set()
-        last_lvl1 = None
-        for (lvl1, lvl2) in cols:
-            if lvl1.startswith('Unnamed'):
-                st.add(lvl2)
-                cols_fixed.append((last_lvl1, lvl2))
-            else:
-                st.add(lvl1)
-                st.add(lvl2)
-                cols_fixed.append((lvl1, lvl2))
-                last_lvl1 = lvl1
-        lst = [st]
-        mlb.fit_transform(lst)
-        sentence_categories_df.columns = pd.MultiIndex.from_tuples(cols_fixed)
-        return mlb
+        _df = pd.concat(_dfs)
+        _df.to_csv(self._sentence_label_path(self, field=field), index=False, sep='\t')
 
     def _word_embedding_path(self, field):
         return os.path.join(os.getenv('CACHE_DIR'), f'word-embedding-field-{field}.pkl')
@@ -154,29 +97,27 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         self.sent_tokenizer = PunktSentenceTokenizer()
         self.word_tokenizer = TweetTokenizer()
 
-        self.num_view_position = max(self.view_position_to_index.values()) + 1
+        self.view_position_size = max(self.view_position_to_index.values()) + 1
 
         if is_train:
-            '''
-            if not os.path.isfile(self._wordmap_path(field=field)):
-                self._make_wordmap(field=field)
-            '''
+            if not os.path.isfile(self._sentence_label_path(field=field)):
+                self._make_sentence_label(field=field)
 
             if not os.path.isfile(self._word_embedding_path(field=field)):
                 self._make_word_embedding(field=field)
-            if not os.path.isfile(self._labels_path(field=field)):
-                self._make_labels(field=field)
 
-        word_vectors = KeyedVectors.load(self._word_embedding_path(field=field))
-        self.labels = torch.load(self._labels_path(field=field))
+            self.df_sentence_label = pd.read_csv(self._sentence_label_path(field=field), sep='\t', dtype={'rad_id': str}).set_index('rad_id')
+            self.label_columns = [column for column in self.df_sentence_label.columns if column.startswith('label_')]
+            self.label_size = len(self.label_columns)
 
+            word_vectors = KeyedVectors.load(self._word_embedding_path(field=field))
 
-        self.index_to_word = word_vectors.index2entity + [Token.unk]
-        self.word_to_index = dict(zip(self.index_to_word, range(len(self.index_to_word))))
-        self.word_embedding = np.concatenate([
-            word_vectors.vectors,
-            np.zeros((1, embedding_size)),
-        ], axis=0).astype(np.float32)
+            self.index_to_word = word_vectors.index2entity + [Token.unk]
+            self.word_to_index = dict(zip(self.index_to_word, range(len(self.index_to_word))))
+            self.word_embedding = np.concatenate([
+                word_vectors.vectors,
+                np.zeros((1, embedding_size)),
+            ], axis=0).astype(np.float32)
 
         # TODO(stmharry): ColorJitter
         self.transform = Compose([
@@ -194,7 +135,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         image = self.transform(image)
 
         view_position_index = self.view_position_to_index.get(item.view_position, 0)
-        view_position = torch.arange(self.num_view_position) == view_position_index
+        view_position = (torch.arange(self.view_position_size) == view_position_index)
         view_position = torch.as_tensor(view_position, dtype=torch.float)
 
         _item = {
@@ -207,10 +148,9 @@ class MimicCXRDataset(torch.utils.data.Dataset):
             text = []
             sent_length = []
 
-            sentences = self.sent_tokenizer.tokenize(item.text)
-            sentences = sentences[:min(len(sentences), self.max_report_length)]
-            for sentence in sentences:
-                words = self.word_tokenizer.tokenize(sentence)
+            df_sentence = self.df_sentence_label.loc[[item.rad_id]]
+            for item_sentence in df_sentence.itertuples():
+                words = self.word_tokenizer.tokenize(item_sentence.sentence)
 
                 num_words = min(len(words), self.max_sentence_length - 1) + 1
                 words = torch.as_tensor((
@@ -226,7 +166,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
             sent_length = torch.as_tensor(sent_length, dtype=torch.long)
             text_length = torch.as_tensor(sent_length.numel(), dtype=torch.long)
 
-            label = self.labels[index]
+            label = torch.as_tensor(df_sentence[self.label_columns].values, dtype=torch.float)
 
             num = torch.arange(text_length, dtype=torch.long).unsqueeze(1)
             stop = torch.as_tensor(num == text_length - 1, dtype=torch.float)

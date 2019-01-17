@@ -1,6 +1,7 @@
 absl-py==0.6.1
 gensim==3.6.0
 htmltag==1.7
+joblib==0.12.2
 json2html==1.2.1
 nltk==3.4
 pandas==0.23.4
