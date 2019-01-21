@@ -1,3 +1,4 @@
+import functools
 import logging
 import torch
 import torch.nn.functional as F
@@ -18,8 +19,10 @@ from torchvision.models.resnet import (
 
 from api import Phase, Token
 from api.utils import (
+    expand_to_sequence,
     pack_padded_sequence,
     pad_packed_sequence,
+    pad_sequence,
     print_batch,
 )
 
@@ -50,8 +53,69 @@ class Module(_Module):
     def forward(self, batch, phase=None, **kwargs):
         if phase == Phase.train:
             return self._train(batch, **kwargs)
+        elif phase == Phase.val:
+            return self._val(batch, **kwargs)
         elif phase == Phase.test:
             return self._test(batch, **kwargs)
+
+
+class Model(Module):
+    report_keys = ['image', 'view_position']
+    sentence_keys = ['image', 'view_position', 'text', 'label', 'stop', 'sent_length', '_label', '_topic', '_stop', '_temp']
+    word_keys = ['text', '_attention', '_log_probability', '_score', '_text']
+
+    def __init__(self, **kwargs):
+        super(Model, self).__init__()
+
+        self.mode = kwargs['mode']
+
+        self.image_encoder = ImageEncoder(**kwargs)
+        self.report_decoder = ReportDecoder(**kwargs)
+        self.sentence_decoder = SentenceDecoder(**kwargs)
+
+    def _map(self, batch, func, keys):
+        _batch = {}
+        for key in keys:
+            if key in batch:
+                _batch[key] = func(batch[key])
+
+        return _batch
+
+    def _train(self, batch, teacher_forcing_ratio):
+        batch.update(self.image_encoder(batch))
+        batch.update(self.report_decoder._train(batch, length=batch['text_length'], teacher_forcing_ratio=teacher_forcing_ratio))
+
+        for key in ['image', 'view_position']:
+            batch[key] = expand_to_sequence(batch[key], length=torch.max(batch['text_length']))
+
+        for key in ['image', 'view_position', 'text', 'label', 'stop', 'sent_length', '_label', '_topic', '_stop', '_temp']:
+            batch[key] = pack_padded_sequence(batch[key], length=batch['text_length'])
+
+        if self.mode == 'full':
+            batch.update(self.sentence_decoder._train(batch, length=batch['sent_length'], teacher_forcing_ratio=teacher_forcing_ratio))
+
+        return batch
+
+    def _val(self, batch, beam_size, alpha, beta, is_val=True):
+        batch.update(self.image_encoder(batch))
+        batch.update(self.report_decoder._test(batch))
+
+        for key in ['image', 'view_position']:
+            batch[key] = expand_to_sequence(batch[key], length=torch.max(batch['_text_length']))
+
+        for key in ['image', 'view_position', '_label', '_topic', '_stop', '_temp']:
+            batch[key] = pack_padded_sequence(batch[key], length=batch['_text_length'])
+
+        if is_val:
+            for key in ['text', 'label', 'stop', 'sent_length']:
+                batch[key] = pack_padded_sequence(batch[key], length=batch['text_length'])
+
+        if self.mode == 'full':
+            batch.update(self.sentence_decoder._test(batch, beam_size=beam_size, alpha=alpha, beta=beta))
+
+        return batch
+
+    _test = functools.partial(_val, is_val=False)
 
 
 class ImageEncoder(ResNet):
@@ -122,10 +186,10 @@ class ReportDecoder(Module):
         ]
         self.fc = Linear(self.hidden_size, sum(self.fc_sizes))
         self.lstm_sizes = [
-            self.embedding_size,      # image
-            self.view_position_size,  # view_position
-            1,                        # begin
-            self.label_size,          # label
+            self.embedding_size,          # image
+            2 * self.view_position_size,  # view_position
+            1,                            # begin
+            self.label_size,              # label
         ]
         self.lstm_cell = LSTMCell(sum(self.lstm_sizes), self.hidden_size)
         self.dropout = Dropout(self.dropout)
@@ -333,11 +397,11 @@ class SentenceDecoder(Module):
         self.fc_h = Linear(self.embedding_size, self.hidden_size)
         self.fc_m = Linear(self.embedding_size, self.hidden_size)
         self.lstm_sizes = [
-            self.embedding_size,      # image
-            self.view_position_size,  # view_position
-            self.label_size,          # label
-            self.hidden_size,         # topic
-            self.embedding_size,      # text
+            self.embedding_size,          # image
+            2 * self.view_position_size,  # view_position
+            self.label_size,              # label
+            self.hidden_size,             # topic
+            self.embedding_size,          # text
         ]
         self.lstm_cell = LSTMCell(sum(self.lstm_sizes), self.hidden_size)
         self.fc_sizes = [
@@ -452,6 +516,12 @@ class SentenceDecoder(Module):
 
             outputs.append({key: _batch[key] for key in ['_attention', '_log_probability', '_text']})
 
+        outputs.extend([{
+            '_attention': torch.zeros((0, self.image_size * self.image_size + 1), dtype=torch.float).cuda(),
+            '_log_probability': torch.zeros((0, self.vocab_size), dtype=torch.float).cuda(),
+            '_text': torch.zeros((0,), dtype=torch.float).cuda(),
+        }] * (self.max_sentence_length - int(torch.max(length))))
+
         outputs = {key: torch.nn.utils.rnn.pad_sequence([output[key] for output in outputs]) for key in outputs[0].keys()}
 
         return outputs
@@ -491,7 +561,8 @@ class SentenceDecoder(Module):
         _this_text = torch.full((batch_size * beam_size,), self.word_to_index[Token.bos], dtype=torch.long).cuda()
 
         _text = torch.zeros((batch_size * beam_size, 0), dtype=torch.long).cuda()
-        _sum_log_probability = torch.zeros((batch_size * beam_size,), dtype=torch.float).cuda()
+        _attention = torch.zeros((batch_size * beam_size, 0, self.image_size * self.image_size + 1), dtype=torch.float).cuda()
+        _log_probability = torch.zeros((batch_size * beam_size,), dtype=torch.float).cuda()
 
         outputs = []
         for t in range(self.max_sentence_length):
@@ -514,19 +585,18 @@ class SentenceDecoder(Module):
                 'm': m,
             })
 
-            (h, m, _attention, _log_probability) = [
+            (h, m, _this_attention, _this_log_probability) = [
                 _batch[key]
                 for key in ['h', 'm', '_attention', '_log_probability']
             ]
 
-
-            _log_probability = _sum_log_probability.unsqueeze(1) + _log_probability
+            _log_probability = _log_probability.unsqueeze(1) + _this_log_probability
             _log_probability = pad_packed_sequence(_log_probability, batch_length, padding_value=float('-inf'))
             if t == 0:  # At t = 0, there is only one beam
                 _log_probability = _log_probability.narrow(1, 0, 1)
-            (_sum_log_probability, _top_index) = _log_probability.view(batch_size, -1).topk(beam_size, 1)
+            (_log_probability, _top_index) = _log_probability.view(batch_size, -1).topk(beam_size, 1)
 
-            _sum_log_probability = pack_padded_sequence(_sum_log_probability, batch_length)
+            _log_probability = pack_padded_sequence(_log_probability, batch_length)
             _index = pack_padded_sequence(_top_index / self.vocab_size + batch_begin.view(-1, 1), batch_length)
             _this_text = pack_padded_sequence(_top_index % self.vocab_size, batch_length)
 
@@ -534,6 +604,7 @@ class SentenceDecoder(Module):
                 _this_text = torch.full((batch_size_t,), self.word_to_index[Token.eos], dtype=torch.long).cuda()
 
             _text = torch.cat([_text[_index], _this_text.unsqueeze(1)], 1)
+            _attention = torch.cat([_attention[_index], _this_attention.unsqueeze(1)], 1)
             _length = torch.full((batch_size_t, 1), t + 1, dtype=torch.long).cuda()
 
             is_end = (_this_text == self.word_to_index[Token.eos])
@@ -541,32 +612,38 @@ class SentenceDecoder(Module):
                 output = {
                     '_index': batch_index[is_end].unsqueeze(1),
                     '_attention': _attention[is_end],
-                    '_score': _sum_log_probability[is_end].unsqueeze(1) / ((beta + t) ** alpha / (beta + 1) ** alpha),  # https://arxiv.org/pdf/1609.08144.pdf
-                    '_log_probability': _sum_log_probability[is_end].unsqueeze(1),
+                    '_score': _log_probability[is_end].unsqueeze(1) / ((beta + t) / (beta + 1)) ** alpha,  # https://arxiv.org/pdf/1609.08144.pdf
+                    '_log_probability': _log_probability[is_end].unsqueeze(1),
                     '_text': _text[is_end],
                     '_sent_length': _length[is_end],
                 }
                 outputs.extend([dict(zip(output.keys(), values)) for values in zip(*output.values())])
 
-                (batch_index, h, m, _sum_log_probability, _this_text, _text) = [
+                (batch_index, h, m, _log_probability, _this_text, _text) = [
                     value[~is_end]
-                    for value in [batch_index, h, m, _sum_log_probability, _this_text, _text]
+                    for value in [batch_index, h, m, _log_probability, _this_text, _text]
                 ]
 
             if is_end.all():
                 break
 
-        outputs = {key: torch.nn.utils.rnn.pad_sequence([output[key] for output in outputs], batch_first=True) for key in outputs[0].keys()}
+        outputs = {
+            key: pad_sequence(
+                [output[key] for output in outputs],
+                batch_first=True,
+                total_length=self.max_sentence_length if key in ['_attention', '_text'] else None,
+            )
+            for key in outputs[0].keys()
+        }
 
         # Index the beams
         _index = outputs['_index'].squeeze(1).argsort(0)
-        outputs = {key: value[_index].view(batch_size, beam_size, -1) for (key, value) in outputs.items()}
+        outputs = {key: value[_index] for (key, value) in outputs.items()}
 
         # Sort beams internally by scores
-        _index = outputs['_score'].argsort(1, descending=True)
-        batch_begin = torch.arange(0, batch_size * beam_size, beam_size).view(-1, 1, 1).cuda()
-        _index = (_index + batch_begin).view(-1)
-        outputs = {key: value.view(batch_size * beam_size, -1)[_index].view(batch_size, beam_size, -1) for (key, value) in outputs.items()}
+        _row = torch.arange(0, batch_size * beam_size, beam_size).view(-1, 1).cuda()
+        _col = outputs['_score'].view(batch_size, beam_size).argsort(1, descending=True)
+        outputs = {key: value[_row + _col] for (key, value) in outputs.items()}
 
         outputs.pop('_index')
         outputs['_score'] = outputs['_score'].squeeze(2)
