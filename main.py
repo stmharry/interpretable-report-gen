@@ -2,7 +2,6 @@
 # Pretrained models for image embeddings
 # Reinforcement Learning on CIDEr
 # Eval metrics
-# provide prev x-ray info
 
 # scenarios
 # - find best seqs to eval at test time
@@ -41,19 +40,22 @@ from mimic_cxr.utils import Log
 from api import Phase
 from api.datasets import MimicCXRDataset
 from api.data_loader import CollateFn
-from api.models import (
-    Module,
-    ImageEncoder,
-    ReportDecoder,
-    SentenceDecoder,
-)
+from api.models import Model
 from api.utils import (
     SummaryWriter,
     to_numpy,
+    sent_to_report,
     expand_to_sequence,
     pack_padded_sequence,
     pad_packed_sequence,
     print_batch,
+)
+from api.metrics import (
+    Bleu,
+    Meteor,
+    Rouge,
+    CiderD as Cider,
+    Spice,
 )
 
 
@@ -101,45 +103,6 @@ flags.DEFINE_string('working_dir', os.getenv('WORKING_DIR'), 'Working directory 
 FLAGS = flags.FLAGS
 
 
-class Model(Module):
-    def __init__(self, **kwargs):
-        super(Model, self).__init__()
-
-        self.image_encoder = ImageEncoder(**kwargs)
-        self.report_decoder = ReportDecoder(**kwargs)
-        self.sentence_decoder = SentenceDecoder(**kwargs)
-
-    def _train(self, batch, teacher_forcing_ratio):
-        batch.update(self.image_encoder(batch))
-        batch.update(self.report_decoder._train(batch, length=batch['text_length'], teacher_forcing_ratio=teacher_forcing_ratio))
-
-        for key in ['image', 'view_position']:
-            batch[key] = expand_to_sequence(batch[key], torch.max(batch['text_length']))
-
-        for key in ['image', 'view_position', 'text', 'label', 'stop', 'sent_length', '_label', '_topic', '_stop', '_temp']:
-            batch[key] = pack_padded_sequence(batch[key], batch['text_length'])
-
-        if FLAGS.mode == 'full':
-            batch.update(self.sentence_decoder._train(batch, length=batch['sent_length'], teacher_forcing_ratio=teacher_forcing_ratio))
-
-        return batch
-
-    def _test(self, batch, beam_size, alpha, beta):
-        batch.update(self.image_encoder(batch))
-        batch.update(self.report_decoder._test(batch))
-
-        for key in ['image', 'view_position']:
-            batch[key] = expand_to_sequence(batch[key], torch.max(batch['_text_length']))
-
-        for key in ['image', 'view_position', '_label', '_topic', '_stop', '_temp']:
-            batch[key] = pack_padded_sequence(batch[key], batch['_text_length'])
-
-        if FLAGS.mode == 'full':
-            batch.update(self.sentence_decoder._test(batch, beam_size=beam_size, alpha=alpha, beta=beta))
-
-        return batch
-
-
 def train():
     optimizer = torch.optim.Adam(model.parameters(), lr=FLAGS.lr)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, FLAGS.lr_decay_epochs, FLAGS.lr_decay)
@@ -158,13 +121,13 @@ def train():
         scheduler.step()
         teacher_forcing_ratio = max(0, 1 - (num_epoch // FLAGS.tf_decay_epochs) * FLAGS.tf_decay)
 
-        for phase in Phase.__all__:
+        for phase in [Phase.train, Phase.val]:
             log = Log()
 
             if phase == Phase.train:
                 data_loader = train_loader
                 model.train()
-            elif phase == Phase.test:
+            elif phase == Phase.val:
                 data_loader = val_loader
                 model.eval()
 
@@ -189,15 +152,29 @@ def train():
                     })
 
                     if FLAGS.mode == 'full':
-                        text = pack_padded_sequence(batch['text'], batch['sent_length'])
+                        text = pack_padded_sequence(batch['text'], length=batch['sent_length'])
+                        _text = pack_padded_sequence(batch['_text'], length=batch['sent_length'])
+                        _log_probability = pack_padded_sequence(batch['_log_probability'], length=batch['sent_length'])
 
                         losses.update({
-                            'word_ce': F.nll_loss(batch['_log_probability'], batch['text']),
+                            'word_ce': F.nll_loss(_log_probability, text),
                         })
 
-                elif phase == Phase.test:
+                elif phase == Phase.val:
                     with torch.no_grad():
                         batch = model(batch, phase=phase, beam_size=FLAGS.beam_size, alpha=FLAGS.alpha, beta=FLAGS.beta)
+
+                    if FLAGS.mode == 'full':
+                        texts = sent_to_report(batch['text'], sent_length=batch['sent_length'] - 1, text_length=batch['text_length'])
+                        _texts = sent_to_report(batch['_text'][:, 0], sent_length=batch['_sent_length'][:, 0] - 1, text_length=batch['_text_length'])
+
+                        gts = {}
+                        res = {}
+                        for (num, (text, _text)) in enumerate(zip(texts, _texts)):
+                            gts[num] = [' '.join([train_dataset.index_to_word[word] for word in text])]
+                            res[num] = [' '.join([train_dataset.index_to_word[word] for word in _text])]
+
+                        scorers[3].compute_score(gts, res)  # TODO(stmharry): use all metrics
 
                 if phase == Phase.train:
                     total_loss = sum(losses.values())
@@ -219,15 +196,13 @@ def train():
                         writer.add_log(_log, prefix=phase, global_step=num_step)
 
                     if (FLAGS.mode == 'full') and (num_step % FLAGS.log_text_steps == 0):
-                        text_length_in_words = pad_packed_sequence(batch['sent_length'], batch['text_length']).sum(1)
-
-                        texts = batch['text'].split(text_length_in_words.tolist())
-                        _texts = batch['_text'].split(text_length_in_words.tolist())
+                        texts = sent_to_report(batch['text'], sent_length=batch['sent_length'], text_length=batch['text_length'])
+                        _texts = sent_to_report(batch['_text'], sent_length=batch['sent_length'], text_length=batch['text_length'])
 
                         writer.add_texts(texts, 'text', prefix=phase, index_to_word=train_dataset.index_to_word, global_step=num_step)
                         writer.add_texts(_texts, '_text', prefix=phase, index_to_word=train_dataset.index_to_word, global_step=num_step)
 
-            if phase == Phase.test:
+            if phase == Phase.val:
                 writer.add_log(log, prefix=phase, global_step=num_step)
 
         if num_epoch % FLAGS.save_epochs == 0:
@@ -359,7 +334,7 @@ if __name__ == '__main__':
     test_df  = df[df.subject_id.isin(mimic_cxr.test_subject_ids)]
 
     if FLAGS.debug_subsample:
-        train_df = train_df.iloc[:int(0.001 * len(train_df))]
+        train_df = train_df.iloc[:int(0.0001 * len(train_df))]
 
     Dataset = functools.partial(
         MimicCXRDataset,
@@ -425,5 +400,7 @@ if __name__ == '__main__':
 
     working_dir = os.path.join(working_dir, datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S-%f'))
     os.makedirs(working_dir)
+
+    scorers = [Bleu(4), Meteor(), Rouge(), Cider(df_cache=train_dataset.df_cache)]
 
     locals()[FLAGS.do]()

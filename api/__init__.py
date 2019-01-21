@@ -1,8 +1,7 @@
 class Phase:
     train = 'train'
+    val = 'val'
     test = 'test'
-
-    __all__ = [train, test]
 
 class Token:
     bos = '<bos>'

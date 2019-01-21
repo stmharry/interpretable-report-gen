@@ -17,6 +17,7 @@ from sklearn.preprocessing import MultiLabelBinarizer
 from torchvision.transforms import Compose, ToTensor
 
 from api import Token
+from api.metrics import CiderScorer
 
 
 class MimicCXRDataset(torch.utils.data.Dataset):
@@ -31,18 +32,20 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         yield from self._iterate_sentences()
 
     def _iterate_sentences(self):
-        for item in tqdm.tqdm(self.df.itertuples(), total=len(self.df)):
-            for sentence in self.sent_tokenizer.tokenize(item.text):
-                yield (
-                    [Token.bos] +
-                    self.word_tokenizer.tokenize(sentence) +
-                    [Token.eos]
-                )
+        for item in tqdm.tqdm(self.df_sentence_label.itertuples(), total=len(self.df_sentence_label)):
+            yield (
+                [Token.bos] +
+                df_sentence_label['sentence'].split()
+                [Token.eos]
+            )
 
     def _sentence_label_path(self, field):
         return os.path.join(os.getenv('CACHE_DIR'), f'sentence-label-field-{field}.tsv')
 
     def _make_sentence_label(self, field):
+        def _tokenize_join(sentence):
+            return ' '.join(self.word_tokenizer.tokenize(sentence))
+
         df = self.df.drop_duplicates('rad_id')[['rad_id', 'text']]
 
         df_regex_path = os.path.join(os.path.dirname(__file__), os.pardir, 'data', 'labels.tsv')
@@ -64,12 +67,13 @@ class MimicCXRDataset(torch.utils.data.Dataset):
                     name=f'label_{label}',
                 ))
 
+            sentences = sentences.apply(_tokenize_join)
             _series.append(sentences)
 
             _dfs.append(pd.concat(_series, axis=1))
 
         _df = pd.concat(_dfs)
-        _df.to_csv(self._sentence_label_path(self, field=field), index=False, sep='\t')
+        _df.to_csv(self._sentence_label_path(field=field), index=False, sep='\t')
 
     def _word_embedding_path(self, field):
         return os.path.join(os.getenv('CACHE_DIR'), f'word-embedding-field-{field}.pkl')
@@ -77,6 +81,19 @@ class MimicCXRDataset(torch.utils.data.Dataset):
     def _make_word_embedding(self, field):
         word2vec = Word2Vec(self, size=self.embedding_size, min_count=self.min_word_freq, workers=24)
         word2vec.wv.save(self._word_embedding_path(field=field))
+
+    def _cider_cache_path(self):
+        return os.path.join(os.getenv('CACHE_DIR'), f'cider-cache.pkl')
+
+    def _make_cider_cache(self):
+        cider_scorer = CiderScorer()
+        for sentence in tqdm.tqdm(self.df_sentence_label['sentence']):
+            cider_scorer += (None, [sentence])
+        cider_scorer.compute_doc_freq()
+        torch.save({
+            'document_frequency': cider_scorer.document_frequency,
+            'rel_freq': len(cider_scorer.crefs),
+        }, self._cider_cache_path())
 
     def __init__(self,
                  df,
@@ -98,17 +115,18 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         self.word_tokenizer = TweetTokenizer()
 
         self.view_position_size = max(self.view_position_to_index.values()) + 1
+        self.view_position_size = 2 * self.view_position_size  # TODO(stmharry): this is a bug
 
         if is_train:
             if not os.path.isfile(self._sentence_label_path(field=field)):
                 self._make_sentence_label(field=field)
 
-            if not os.path.isfile(self._word_embedding_path(field=field)):
-                self._make_word_embedding(field=field)
-
             self.df_sentence_label = pd.read_csv(self._sentence_label_path(field=field), sep='\t', dtype={'rad_id': str}).set_index('rad_id')
             self.label_columns = [column for column in self.df_sentence_label.columns if column.startswith('label_')]
             self.label_size = len(self.label_columns)
+
+            if not os.path.isfile(self._word_embedding_path(field=field)):
+                self._make_word_embedding(field=field)
 
             word_vectors = KeyedVectors.load(self._word_embedding_path(field=field))
 
@@ -118,6 +136,11 @@ class MimicCXRDataset(torch.utils.data.Dataset):
                 word_vectors.vectors,
                 np.zeros((1, embedding_size)),
             ], axis=0).astype(np.float32)
+
+            if not os.path.isfile(self._cider_cache_path()):
+                self._make_cider_cache()
+
+            self.df_cache = torch.load(self._cider_cache_path())
 
         # TODO(stmharry): ColorJitter
         self.transform = Compose([
@@ -129,13 +152,19 @@ class MimicCXRDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, index):
         item = self.df.iloc[index]
+        df_rad = self.df.loc[self.df.rad_id == item.rad_id]
 
         path = os.path.join(os.getenv('CACHE_DIR'), 'images', f'{item.dicom_id}.png')
         image = PIL.Image.open(path)
         image = self.transform(image)
 
         view_position_index = self.view_position_to_index.get(item.view_position, 0)
-        view_position = (torch.arange(self.view_position_size) == view_position_index)
+        view_position_indices = [self.view_position_to_index.get(view_position, 0) for view_position in df_rad.view_position]
+
+        view_position = torch.cat([
+            torch.arange(self.view_position_size) == view_position_index,
+            (torch.arange(self.view_position_size).unsqueeze(1) == torch.as_tensor(view_position_indices)).any(1),
+        ], 0)
         view_position = torch.as_tensor(view_position, dtype=torch.float)
 
         _item = {
@@ -150,7 +179,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
 
             df_sentence = self.df_sentence_label.loc[[item.rad_id]]
             for item_sentence in df_sentence.itertuples():
-                words = self.word_tokenizer.tokenize(item_sentence.sentence)
+                words = item_sentence.sentence.split()
 
                 num_words = min(len(words), self.max_sentence_length - 1) + 1
                 words = torch.as_tensor((
