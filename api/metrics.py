@@ -2,6 +2,10 @@ import numpy as np
 
 from pyciderevalcap3.ciderD.ciderD import CiderD as _CiderD
 from pyciderevalcap3.ciderD.ciderD_scorer import CiderScorer as _CiderScorer
+from pycocoevalcap3.bleu.bleu import Bleu as _Bleu
+from pycocoevalcap3.bleu.bleu_scorer import BleuScorer
+from pycocoevalcap3.rouge.rouge import Rouge
+from pycocoevalcap3.spice.spice import Spice
 
 
 class CiderScorer(_CiderScorer):
@@ -24,12 +28,14 @@ class CiderD(_CiderD):
         for id in gts:
             cider_scorer += (res[id][0], gts[id])
 
-        (score, scores) = cider_scorer.compute_score(self._df)
-
-        return (score, scores)
+        return cider_scorer.compute_score(self._df)
 
 
-from pycocoevalcap3.bleu.bleu import Bleu
-from pycocoevalcap3.meteor.meteor import Meteor
-from pycocoevalcap3.rouge.rouge import Rouge
-from pycocoevalcap3.spice.spice import Spice
+class Bleu(_Bleu):
+    def compute_score(self, gts, res):
+        bleu_scorer = BleuScorer(n=self._n)
+
+        for id in gts:
+            bleu_scorer += (res[id][0], gts[id])
+
+        return bleu_scorer.compute_score(option='closest')

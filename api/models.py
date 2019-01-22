@@ -115,7 +115,7 @@ class Model(Module):
 
         return batch
 
-    _test = functools.partial(_val, is_val=False)
+    _test = functools.partialmethod(_val, is_val=False)
 
 
 class ImageEncoder(ResNet):
