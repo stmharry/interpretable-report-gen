@@ -52,7 +52,6 @@ from api.utils import (
 )
 from api.metrics import (
     Bleu,
-    Meteor,
     Rouge,
     CiderD as Cider,
     Spice,
