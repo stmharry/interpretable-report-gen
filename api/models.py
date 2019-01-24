@@ -1,5 +1,6 @@
 import functools
 import logging
+import os
 import torch
 import torch.nn.functional as F
 
@@ -60,10 +61,6 @@ class Module(_Module):
 
 
 class Model(Module):
-    report_keys = ['image', 'view_position']
-    sentence_keys = ['image', 'view_position', 'text', 'label', 'stop', 'sent_length', '_label', '_topic', '_stop', '_temp']
-    word_keys = ['text', '_attention', '_log_probability', '_score', '_text']
-
     def __init__(self, **kwargs):
         super(Model, self).__init__()
 
@@ -71,7 +68,8 @@ class Model(Module):
 
         self.image_encoder = ImageEncoder(**kwargs)
         self.report_decoder = ReportDecoder(**kwargs)
-        self.sentence_decoder = SentenceDecoder(**kwargs)
+        if self.mode == 'full':
+            self.sentence_decoder = SentenceDecoder(**kwargs)
 
     def _map(self, batch, func, keys):
         _batch = {}
@@ -115,7 +113,7 @@ class Model(Module):
 
         return batch
 
-    _test = functools.partial(_val, is_val=False)
+    _test = functools.partialmethod(_val, is_val=False)
 
 
 class ImageEncoder(ResNet):
@@ -176,34 +174,47 @@ class ReportDecoder(Module):
         self.dropout            = kwargs['dropout']
         self.max_report_length  = kwargs['max_report_length']
 
+        self.__use_continuous_label = kwargs['__use_continuous_label']
+        self.__no_recurrent_label   = kwargs['__no_recurrent_label']
+
         self.fc_h = Linear(self.embedding_size, self.hidden_size)
         self.fc_m = Linear(self.embedding_size, self.hidden_size)
-        self.fc_sizes = [
-            self.label_size,   # label
-            self.hidden_size,  # topic
-            1,                 # stop
-            1,                 # temp
-        ]
-        self.fc = Linear(self.hidden_size, sum(self.fc_sizes))
-        self.lstm_sizes = [
-            self.embedding_size,          # image
-            2 * self.view_position_size,  # view_position
-            1,                            # begin
-            self.label_size,              # label
-        ]
+
+        self.lstm_sizes = (
+            [self.embedding_size] +                                   # image
+            [2 * self.view_position_size] +                           # view_position
+            [1] +                                                     # begin
+            ([] if self.__no_recurrent_label else [self.label_size])  # label
+        )
         self.lstm_cell = LSTMCell(sum(self.lstm_sizes), self.hidden_size)
+        self.fc_sizes = (
+            ([] if self.__no_recurrent_label else [self.label_size]) +  # label
+            [self.hidden_size] +                                        # topic
+            [1] +                                                       # stop
+            [1]                                                         # temp
+        )
+        self.fc = Linear(self.hidden_size, sum(self.fc_sizes))
+        if self.__no_recurrent_label:
+            self.fc_label = Linear(self.hidden_size, self.label_size)
+
         self.dropout = Dropout(self.dropout)
 
     def _step(self, batch):
-        x = torch.cat([
-            self.dropout(batch['image_mean']),
-            batch['view_position'],
-            batch['begin'],
-            batch['label'],
-        ], 1)
+        x = torch.cat((
+            [self.dropout(batch['image_mean'])] +
+            [batch['view_position']] +
+            [batch['begin']] +
+            [] if self.__no_recurrent_label else [batch['label']]
+        ), 1)
 
         (h, m) = self.lstm_cell(x, (batch['h'], batch['m']))
-        (_label, _topic, _stop, _temp) = self.fc(self.dropout(h)).split(self.fc_sizes, 1)
+        outputs = self.fc(self.dropout(h)).split(self.fc_sizes, 1)
+
+        if self.__no_recurrent_label:
+            (_topic, _stop, _temp) = outputs
+            _label = torch.sigmoid(self.fc_label(self.dropout(_topic)))
+        else:
+            (_label, _topic, _stop, _temp) = outputs
 
         return {
             'h': h,
@@ -270,7 +281,7 @@ class ReportDecoder(Module):
             this_label = torch.where(
                 torch.rand((batch_size_t, 1), dtype=torch.float).cuda() < teacher_forcing_ratio,
                 label[:batch_size_t, t],
-                (_label > 0.5).float(),
+                _label if self.__use_continuous_label else (_label > 0.5).float(),
             )
 
             outputs.append({key: _batch[key] for key in ['_label', '_topic', '_stop', '_temp']})
@@ -334,7 +345,7 @@ class ReportDecoder(Module):
                 for key in ['h', 'm', '_label', '_topic', '_stop', '_temp']
             ]
 
-            _this_label = (_this_label > 0.5).float()
+            _this_label = _this_label if self.__use_continuous_label else (_this_label > 0.5).float()  # PATCH
             if t == self.max_report_length - 1:
                 _this_stop = torch.full((batch_size_t, 1), 1.0, dtype=torch.float).cuda()
 
@@ -382,6 +393,7 @@ class SentenceDecoder(Module):
 
         self.image_size          = kwargs['image_size']
         self.view_position_size  = kwargs['view_position_size']
+        self.word_embedding      = kwargs['word_embedding']
         self.index_to_word       = kwargs['index_to_word']
         self.word_to_index       = kwargs['word_to_index']
         self.label_size          = kwargs['label_size']
@@ -390,19 +402,22 @@ class SentenceDecoder(Module):
         self.dropout             = kwargs['dropout']
         self.max_sentence_length = kwargs['max_sentence_length']
 
+        self.__use_continuous_label = kwargs['__use_continuous_label']
+        self.__no_recurrent_label   = kwargs['__no_recurrent_label']
+
         self.vocab_size = len(self.word_to_index)
 
-        self.word_embedding = Embedding(self.vocab_size, self.embedding_size)
+        self.word_embedding = Embedding.from_pretrained(torch.from_numpy(self.word_embedding), freeze=False)
         self.fc_v = Linear(self.embedding_size, self.hidden_size)
         self.fc_h = Linear(self.embedding_size, self.hidden_size)
         self.fc_m = Linear(self.embedding_size, self.hidden_size)
-        self.lstm_sizes = [
-            self.embedding_size,          # image
-            2 * self.view_position_size,  # view_position
-            self.label_size,              # label
-            self.hidden_size,             # topic
-            self.embedding_size,          # text
-        ]
+        self.lstm_sizes = (
+            [self.embedding_size] +                                   # image
+            [2 * self.view_position_size] +                           # view_position
+            [] if self.__no_recurrent_label else [self.label_size] +  # label
+            [self.hidden_size] +                                      # topic
+            [self.embedding_size]                                     # text
+        )
         self.lstm_cell = LSTMCell(sum(self.lstm_sizes), self.hidden_size)
         self.fc_sizes = [
             self.embedding_size,  # hidden
@@ -417,13 +432,13 @@ class SentenceDecoder(Module):
 
     def _step(self, batch):
         text_embedding = self.word_embedding(batch['text'])
-        x = torch.cat([
-            self.dropout(batch['image_mean']),
-            batch['view_position'],
-            batch['label'],
-            self.dropout(batch['topic']),
-            self.dropout(text_embedding),
-        ], 1)
+        x = torch.cat((
+            [self.dropout(batch['image_mean'])] +
+            [batch['view_position']] +
+            [] if self.__no_recurrent_label else [batch['label']] +
+            [self.dropout(batch['topic'])] +
+            [self.dropout(text_embedding)]
+        ), 1)
 
         (h, m) = self.lstm_cell(x, (batch['h'], batch['m']))
         (hh, s) = F.relu(self.fc(self.dropout(h))).unsqueeze(1).split(self.fc_sizes, 2)
@@ -446,7 +461,6 @@ class SentenceDecoder(Module):
             '_log_probability': _log_probability,
             '_text': _text,
         }
-
 
     @length_sorted_rnn(use_fields=['image', 'view_position', 'text', 'label', '_topic', '_temp'])
     @profile

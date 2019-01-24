@@ -86,3 +86,10 @@ def print_batch(batch, logger=None):
     logger = logger or _logger
     for (key, value) in batch.items():
         logger.info(f'{key}: shape={value.shape}')
+
+
+""" Version
+"""
+
+def version_greater_than(ckpt_path, version):
+    return (ckpt_path is None) or (os.path.getmtime(ckpt_path) > version)

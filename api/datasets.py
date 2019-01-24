@@ -1,4 +1,3 @@
-import joblib
 import numpy as np
 import os
 import pandas as pd
@@ -6,17 +5,14 @@ import PIL.Image
 import torch
 import torch.utils.data
 import tqdm
-import re
-import string
 
 from gensim.models import Word2Vec, KeyedVectors
 from nltk.tokenize.punkt import PunktSentenceTokenizer
 from nltk.tokenize.casual import TweetTokenizer
-from sklearn.preprocessing import MultiLabelBinarizer
 
 from torchvision.transforms import Compose, ToTensor
 
-from api import Token
+from api import Phase, Token
 from api.metrics import CiderScorer
 
 
@@ -35,7 +31,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         for item in tqdm.tqdm(self.df_sentence_label.itertuples(), total=len(self.df_sentence_label)):
             yield (
                 [Token.bos] +
-                df_sentence_label['sentence'].split()
+                self.df_sentence_label['sentence'].split()
                 [Token.eos]
             )
 
@@ -102,22 +98,22 @@ class MimicCXRDataset(torch.utils.data.Dataset):
                  max_report_length,
                  max_sentence_length,
                  embedding_size,
-                 is_train):
+                 phase):
 
         self.df = df
         self.min_word_freq = min_word_freq
         self.max_report_length = max_report_length
         self.max_sentence_length = max_sentence_length
         self.embedding_size = embedding_size
-        self.is_train = is_train
+        self.phase = phase
 
         self.sent_tokenizer = PunktSentenceTokenizer()
         self.word_tokenizer = TweetTokenizer()
 
         self.view_position_size = max(self.view_position_to_index.values()) + 1
-        self.view_position_size = 2 * self.view_position_size  # TODO(stmharry): this is a bug
+        # self.view_position_size = 2 * self.view_position_size  # TODO(stmharry): this is a bug
 
-        if is_train:
+        if (phase == Phase.train) or (phase == Phase.val):
             if not os.path.isfile(self._sentence_label_path(field=field)):
                 self._make_sentence_label(field=field)
 
@@ -173,7 +169,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
             'view_position': view_position,
         }
 
-        if self.is_train:
+        if (self.phase == Phase.train) or (self.phase == Phase.val):
             text = []
             sent_length = []
 
