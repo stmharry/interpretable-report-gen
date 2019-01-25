@@ -18,7 +18,7 @@ from torchvision.models.resnet import (
     Bottleneck,
 )
 
-from api import Phase, Token
+from api import Mode, Phase, Token
 from api.utils import (
     expand_to_sequence,
     pack_padded_sequence,
@@ -64,12 +64,22 @@ class Model(Module):
     def __init__(self, **kwargs):
         super(Model, self).__init__()
 
-        self.mode = kwargs['mode']
+        self.mode           = kwargs['mode']
+        self.embedding_size = kwargs['embedding_size']
+        self.label_size     = kwargs['label_size']
+        self.dropout        = kwargs['dropout']
 
         self.image_encoder = ImageEncoder(**kwargs)
-        self.report_decoder = ReportDecoder(**kwargs)
-        if self.mode == 'full':
-            self.sentence_decoder = SentenceDecoder(**kwargs)
+
+        if self.mode == Mode.debug:
+            self.fc_label = Linear(self.embedding_size, self.label_size)
+            self.drop = Dropout(self.dropout)
+
+        else:
+            self.report_decoder = ReportDecoder(**kwargs)
+
+            if self.mode == Mode.full:
+                self.sentence_decoder = SentenceDecoder(**kwargs)
 
     def _map(self, batch, func, keys):
         _batch = {}
@@ -81,6 +91,11 @@ class Model(Module):
 
     def _train(self, batch, teacher_forcing_ratio):
         batch.update(self.image_encoder(batch))
+
+        if self.mode == Mode.debug:
+            batch['_label'] = torch.sigmoid(self.fc_label(self.drop(batch['image'].mean(1))))
+            return batch
+
         batch.update(self.report_decoder._train(batch, length=batch['text_length'], teacher_forcing_ratio=teacher_forcing_ratio))
 
         for key in ['image', 'view_position']:
@@ -89,13 +104,18 @@ class Model(Module):
         for key in ['image', 'view_position', 'text', 'label', 'stop', 'sent_length', '_label', '_topic', '_stop', '_temp']:
             batch[key] = pack_padded_sequence(batch[key], length=batch['text_length'])
 
-        if self.mode == 'full':
+        if self.mode == Mode.full:
             batch.update(self.sentence_decoder._train(batch, length=batch['sent_length'], teacher_forcing_ratio=teacher_forcing_ratio))
 
         return batch
 
     def _val(self, batch, beam_size, alpha, beta, is_val=True):
         batch.update(self.image_encoder(batch))
+
+        if self.mode == Mode.debug:
+            batch['_label'] = torch.sigmoid(self.fc_label(self.drop(batch['image'].mean(1))))
+            return batch
+
         batch.update(self.report_decoder._test(batch))
 
         for key in ['image', 'view_position']:
@@ -108,7 +128,7 @@ class Model(Module):
             for key in ['text', 'label', 'stop', 'sent_length']:
                 batch[key] = pack_padded_sequence(batch[key], length=batch['text_length'])
 
-        if self.mode == 'full':
+        if self.mode == Mode.full:
             batch.update(self.sentence_decoder._test(batch, beam_size=beam_size, alpha=alpha, beta=beta))
 
         return batch
@@ -126,10 +146,12 @@ class ImageEncoder(ResNet):
         self.embedding_size = kwargs['embedding_size']
         self.dropout        = kwargs['dropout']
 
+        self.__image_encoder_relu = kwargs['__image_encoder_relu']
+
         self.conv1 = Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
         self.avgpool = AdaptiveAvgPool2d((self.image_size, self.image_size))
         self.fc = Conv2d(self.image_embedding_size, self.embedding_size, (1, 1))
-        self.dropout = Dropout(self.dropout)
+        self.drop = Dropout(self.dropout)
 
     @profile
     def forward(self, batch):
@@ -139,7 +161,7 @@ class ImageEncoder(ResNet):
             image (batch_size, 1, 256, 256): Grayscale Image.
 
         Returns:
-            image (batch_size, image_embedding_size, image_size, image_size): Image feature map.
+            image (batch_size, image_size * image_size, image_embedding_size): Image feature map.
 
         """
 
@@ -156,8 +178,12 @@ class ImageEncoder(ResNet):
         image = self.layer4(image)
 
         image = self.avgpool(image)
-        image = self.dropout(image)
+        image = self.drop(image)
         image = self.fc(image)
+
+        if self.__image_encoder_relu:
+            image = self.relu(image)
+
         image = image.view(-1, self.embedding_size, self.image_size * self.image_size).transpose(1, 2)
 
         return {'image': image}
@@ -171,7 +197,7 @@ class ReportDecoder(Module):
         self.label_size         = kwargs['label_size']
         self.embedding_size     = kwargs['embedding_size']
         self.hidden_size        = kwargs['hidden_size']
-        self.dropout            = kwargs['dropout']
+        self.drop               = kwargs['dropout']
         self.max_report_length  = kwargs['max_report_length']
 
         self.__use_continuous_label = kwargs['__use_continuous_label']
@@ -181,10 +207,10 @@ class ReportDecoder(Module):
         self.fc_m = Linear(self.embedding_size, self.hidden_size)
 
         self.lstm_sizes = (
-            [self.embedding_size] +                                   # image
-            [2 * self.view_position_size] +                           # view_position
-            [1] +                                                     # begin
-            ([] if self.__no_recurrent_label else [self.label_size])  # label
+            [self.embedding_size] +                                     # image
+            [2 * self.view_position_size] +                             # view_position
+            [1] +                                                       # begin
+            ([] if self.__no_recurrent_label else [self.label_size])    # label
         )
         self.lstm_cell = LSTMCell(sum(self.lstm_sizes), self.hidden_size)
         self.fc_sizes = (
@@ -197,22 +223,22 @@ class ReportDecoder(Module):
         if self.__no_recurrent_label:
             self.fc_label = Linear(self.hidden_size, self.label_size)
 
-        self.dropout = Dropout(self.dropout)
+        self.drop = Dropout(self.dropout)
 
     def _step(self, batch):
         x = torch.cat((
-            [self.dropout(batch['image_mean'])] +
+            [self.drop(batch['image_mean'])] +
             [batch['view_position']] +
             [batch['begin']] +
-            [] if self.__no_recurrent_label else [batch['label']]
+            ([] if self.__no_recurrent_label else [batch['label']])
         ), 1)
 
         (h, m) = self.lstm_cell(x, (batch['h'], batch['m']))
-        outputs = self.fc(self.dropout(h)).split(self.fc_sizes, 1)
+        outputs = self.fc(self.drop(h)).split(self.fc_sizes, 1)
 
         if self.__no_recurrent_label:
             (_topic, _stop, _temp) = outputs
-            _label = torch.sigmoid(self.fc_label(self.dropout(_topic)))
+            _label = self.fc_label(self.drop(_topic))
         else:
             (_label, _topic, _stop, _temp) = outputs
 
@@ -251,8 +277,8 @@ class ReportDecoder(Module):
         batch_size = len(image)
 
         image_mean = image.mean(1)
-        h = torch.tanh(self.fc_h(self.dropout(image_mean)))
-        m = torch.tanh(self.fc_m(self.dropout(image_mean)))
+        h = torch.tanh(self.fc_h(self.drop(image_mean)))
+        m = torch.tanh(self.fc_m(self.drop(image_mean)))
 
         begin = torch.ones((batch_size, 1), dtype=torch.float).cuda()
         this_label = torch.zeros((batch_size, self.label_size), dtype=torch.float).cuda()
@@ -313,10 +339,11 @@ class ReportDecoder(Module):
         batch_index = torch.arange(batch_size, dtype=torch.long).cuda()
 
         image_mean = image.mean(1)
-        h = torch.tanh(self.fc_h(self.dropout(image_mean)))[batch_index]
-        m = torch.tanh(self.fc_m(self.dropout(image_mean)))[batch_index]
+        h = torch.tanh(self.fc_h(self.drop(image_mean)))[batch_index]
+        m = torch.tanh(self.fc_m(self.drop(image_mean)))[batch_index]
 
         _this_label = torch.zeros((batch_size, self.label_size), dtype=torch.float).cuda()
+        _this_topic = torch.zeros((batch_size, self.hidden_size), dtype=torch.float).cuda()
 
         _label = torch.zeros((batch_size, 0, self.label_size), dtype=torch.float).cuda()
         _topic = torch.zeros((batch_size, 0, self.hidden_size), dtype=torch.float).cuda()
@@ -345,7 +372,7 @@ class ReportDecoder(Module):
                 for key in ['h', 'm', '_label', '_topic', '_stop', '_temp']
             ]
 
-            _this_label = _this_label if self.__use_continuous_label else (_this_label > 0.5).float()  # PATCH
+            _this_label = _this_label if self.__use_continuous_label else (_this_label > 0.5).float()
             if t == self.max_report_length - 1:
                 _this_stop = torch.full((batch_size_t, 1), 1.0, dtype=torch.float).cuda()
 
@@ -367,9 +394,9 @@ class ReportDecoder(Module):
                 }
                 outputs.extend([dict(zip(output.keys(), values)) for values in zip(*output.values())])
 
-                (batch_index, h, m, _this_label, _label, _topic, _stop, _temp) = [
+                (batch_index, h, m, _this_label, _label, _this_topic, _topic, _stop, _temp) = [
                     value[~is_end]
-                    for value in [batch_index, h, m, _this_label, _label, _topic, _stop, _temp]
+                    for value in [batch_index, h, m, _this_label, _label, _this_topic, _topic, _stop, _temp]
                 ]
 
             if is_end.all():
@@ -412,11 +439,11 @@ class SentenceDecoder(Module):
         self.fc_h = Linear(self.embedding_size, self.hidden_size)
         self.fc_m = Linear(self.embedding_size, self.hidden_size)
         self.lstm_sizes = (
-            [self.embedding_size] +                                   # image
-            [2 * self.view_position_size] +                           # view_position
-            [] if self.__no_recurrent_label else [self.label_size] +  # label
-            [self.hidden_size] +                                      # topic
-            [self.embedding_size]                                     # text
+            [self.embedding_size] +                                     # image
+            [2 * self.view_position_size] +                             # view_position
+            ([] if self.__no_recurrent_label else [self.label_size]) +  # label
+            [self.hidden_size] +                                        # topic
+            [self.embedding_size]                                       # text
         )
         self.lstm_cell = LSTMCell(sum(self.lstm_sizes), self.hidden_size)
         self.fc_sizes = [
@@ -428,30 +455,30 @@ class SentenceDecoder(Module):
         self.fc_s = Linear(self.embedding_size, self.hidden_size)
         self.fc_z = Linear(self.hidden_size, 1)
         self.fc_p = Linear(self.embedding_size, self.vocab_size)
-        self.dropout = Dropout(self.dropout)
+        self.drop = Dropout(self.dropout)
 
     def _step(self, batch):
         text_embedding = self.word_embedding(batch['text'])
         x = torch.cat((
-            [self.dropout(batch['image_mean'])] +
+            [self.drop(batch['image_mean'])] +
             [batch['view_position']] +
-            [] if self.__no_recurrent_label else [batch['label']] +
-            [self.dropout(batch['topic'])] +
-            [self.dropout(text_embedding)]
+            ([] if self.__no_recurrent_label else [batch['label']]) +
+            [self.drop(batch['topic'])] +
+            [self.drop(text_embedding)]
         ), 1)
 
         (h, m) = self.lstm_cell(x, (batch['h'], batch['m']))
-        (hh, s) = F.relu(self.fc(self.dropout(h))).unsqueeze(1).split(self.fc_sizes, 2)
-        _hh = self.fc_hh(self.dropout(hh))
-        _s = self.fc_s(self.dropout(s))
+        (hh, s) = F.relu(self.fc(self.drop(h))).unsqueeze(1).split(self.fc_sizes, 2)
+        _hh = self.fc_hh(self.drop(hh))
+        _s = self.fc_s(self.drop(s))
 
         z = torch.tanh(torch.cat([batch['v'], _s], 1) + _hh)
-        z = self.fc_z(self.dropout(z))
+        z = self.fc_z(self.drop(z))
         a = F.softmax(z, 1)
         c = torch.sum(a * torch.cat([batch['image'], s], 1), 1)
 
         _attention = a.squeeze(2)
-        _log_probability = F.log_softmax(self.fc_p(self.dropout(c + hh.squeeze(1))) / batch['temp'], 1)
+        _log_probability = F.log_softmax(self.fc_p(self.drop(c + hh.squeeze(1))) / batch['temp'], 1)
         _text = _log_probability.argmax(1)
 
         return {
@@ -492,9 +519,9 @@ class SentenceDecoder(Module):
         batch_size = len(image)
 
         image_mean = image.mean(1)
-        v = self.fc_v(self.dropout(image))
-        h = torch.tanh(self.fc_h(self.dropout(image_mean)))
-        m = torch.tanh(self.fc_m(self.dropout(image_mean)))
+        v = self.fc_v(self.drop(image))
+        h = torch.tanh(self.fc_h(self.drop(image_mean)))
+        m = torch.tanh(self.fc_m(self.drop(image_mean)))
 
         this_text = torch.full((batch_size,), self.word_to_index[Token.bos], dtype=torch.long).cuda()
 
@@ -568,9 +595,9 @@ class SentenceDecoder(Module):
         batch_index = torch.arange(batch_size, dtype=torch.long).view(-1, 1).expand(-1, beam_size).reshape(-1).cuda()
 
         image_mean = image.mean(1)
-        v = self.fc_v(self.dropout(image))
-        h = torch.tanh(self.fc_h(self.dropout(image_mean)))[batch_index]
-        m = torch.tanh(self.fc_m(self.dropout(image_mean)))[batch_index]
+        v = self.fc_v(self.drop(image))
+        h = torch.tanh(self.fc_h(self.drop(image_mean)))[batch_index]
+        m = torch.tanh(self.fc_m(self.drop(image_mean)))[batch_index]
 
         _this_text = torch.full((batch_size * beam_size,), self.word_to_index[Token.bos], dtype=torch.long).cuda()
 

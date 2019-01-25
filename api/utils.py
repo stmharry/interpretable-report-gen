@@ -1,6 +1,8 @@
+import datetime
 import logging
 import tensorboardX
 import torch
+import os
 
 _logger = logging.getLogger(__name__)
 
@@ -91,5 +93,11 @@ def print_batch(batch, logger=None):
 """ Version
 """
 
-def version_greater_than(ckpt_path, version):
-    return (ckpt_path is None) or (os.path.getmtime(ckpt_path) > version)
+def version_of(ckpt_path):
+    if ckpt_path is None:
+        version = datetime.datetime.now().timestamp()
+    else:
+        ckpt_dir = os.path.basename(os.path.dirname(ckpt_path))
+        version = datetime.datetime.strptime(ckpt_dir, '%Y-%m-%d-%H%M%S-%f').timestamp()
+
+    return version
