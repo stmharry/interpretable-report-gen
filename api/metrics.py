@@ -4,8 +4,21 @@ from pyciderevalcap3.ciderD.ciderD import CiderD as _CiderD
 from pyciderevalcap3.ciderD.ciderD_scorer import CiderScorer as _CiderScorer
 from pycocoevalcap3.bleu.bleu import Bleu as _Bleu
 from pycocoevalcap3.bleu.bleu_scorer import BleuScorer
-from pycocoevalcap3.rouge.rouge import Rouge
-from pycocoevalcap3.spice.spice import Spice
+from pycocoevalcap3.rouge.rouge import Rouge as _Rouge
+from pycocoevalcap3.spice.spice import Spice as _Spice
+
+
+class MetricMixin:
+    def __call__(self, input_, target):
+        gts = {}
+        res = {}
+
+        (_, scores) = self.compute_score(
+            dict(enumerate(target)),
+            dict(enumerate(input_)),
+        )
+
+        return torch.as_tensor(scores, dtype=torch.float).cuda()
 
 
 class CiderScorer(_CiderScorer):
@@ -14,7 +27,7 @@ class CiderScorer(_CiderScorer):
         return np.mean(np.array(score)), np.array(score)
 
 
-class CiderD(_CiderD):
+class CiderD(_CiderD, MetricMixin):
     def __init__(self, df_cache, *args, **kwargs):
         super(CiderD, self).__init__(*args, **kwargs)
 
@@ -31,7 +44,7 @@ class CiderD(_CiderD):
         return cider_scorer.compute_score(self._df)
 
 
-class Bleu(_Bleu):
+class Bleu(_Bleu, MetricMixin):
     def compute_score(self, gts, res):
         bleu_scorer = BleuScorer(n=self._n)
 
@@ -39,3 +52,11 @@ class Bleu(_Bleu):
             bleu_scorer += (res[id][0], gts[id])
 
         return bleu_scorer.compute_score(option='closest')
+
+
+class Rouge(_Rouge, MetricMixin):
+    pass
+
+
+class Spice(_Spice, MetricMixin):
+    pass

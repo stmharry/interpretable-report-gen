@@ -25,13 +25,10 @@ from api.utils import (
     pad_packed_sequence,
     pad_sequence,
     print_batch,
+    profile,
 )
 
 logger = logging.getLogger(__name__)
-
-if 'profile' not in dir(__builtins__):
-    def profile(func):
-        return func
 
 
 def length_sorted_rnn(use_fields=None):
@@ -53,10 +50,13 @@ def length_sorted_rnn(use_fields=None):
 class Module(_Module):
     def forward(self, batch, phase=None, **kwargs):
         if phase == Phase.train:
+            self.train()
             return self._train(batch, **kwargs)
         elif phase == Phase.val:
+            self.eval()
             return self._val(batch, **kwargs)
         elif phase == Phase.test:
+            self.eval()
             return self._test(batch, **kwargs)
 
 
@@ -71,15 +71,15 @@ class Model(Module):
 
         self.image_encoder = ImageEncoder(**kwargs)
 
-        if self.mode == Mode.debug:
+        if self.mode == Mode.debug_label:
             self.fc_label = Linear(self.embedding_size, self.label_size)
             self.drop = Dropout(self.dropout)
 
-        else:
+        elif self.mode in Mode.label_modes:
             self.report_decoder = ReportDecoder(**kwargs)
 
-            if self.mode == Mode.full:
-                self.sentence_decoder = SentenceDecoder(**kwargs)
+        if self.mode in Mode.text_modes:
+            self.sentence_decoder = SentenceDecoder(**kwargs)
 
     def _map(self, batch, func, keys):
         _batch = {}
@@ -89,46 +89,49 @@ class Model(Module):
 
         return _batch
 
+    @profile
     def _train(self, batch, teacher_forcing_ratio):
+        batch = batch.copy()
         batch.update(self.image_encoder(batch))
 
-        if self.mode == Mode.debug:
+        if self.mode == Mode.debug_label:
             batch['_label'] = torch.sigmoid(self.fc_label(self.drop(batch['image'].mean(1))))
-            return batch
 
-        batch.update(self.report_decoder._train(batch, length=batch['text_length'], teacher_forcing_ratio=teacher_forcing_ratio))
+        elif self.mode in Mode.label_modes:
+            batch.update(self.report_decoder._train(batch, length=batch['text_length'], teacher_forcing_ratio=teacher_forcing_ratio))
 
-        for key in ['image', 'view_position']:
-            batch[key] = expand_to_sequence(batch[key], length=torch.max(batch['text_length']))
+            for key in ['image', 'view_position']:
+                batch[key] = expand_to_sequence(batch[key], length=torch.max(batch['text_length']))
 
-        for key in ['image', 'view_position', 'text', 'label', 'stop', 'sent_length', '_label', '_topic', '_stop', '_temp']:
-            batch[key] = pack_padded_sequence(batch[key], length=batch['text_length'])
+            for key in ['image', 'view_position', 'text', 'label', 'stop', 'sent_length', '_label', '_topic', '_stop', '_temp']:
+                batch[key] = pack_padded_sequence(batch[key], length=batch['text_length'])
 
-        if self.mode == Mode.full:
+        if self.mode in Mode.text_modes:
             batch.update(self.sentence_decoder._train(batch, length=batch['sent_length'], teacher_forcing_ratio=teacher_forcing_ratio))
 
         return batch
 
     def _val(self, batch, beam_size, alpha, beta, is_val=True):
+        batch = batch.copy()
         batch.update(self.image_encoder(batch))
 
-        if self.mode == Mode.debug:
+        if self.mode == Mode.debug_label:
             batch['_label'] = torch.sigmoid(self.fc_label(self.drop(batch['image'].mean(1))))
-            return batch
 
-        batch.update(self.report_decoder._test(batch))
+        elif self.mode in Mode.label_modes:
+            batch.update(self.report_decoder._test(batch))
 
-        for key in ['image', 'view_position']:
-            batch[key] = expand_to_sequence(batch[key], length=torch.max(batch['_text_length']))
+            for key in ['image', 'view_position']:
+                batch[key] = expand_to_sequence(batch[key], length=torch.max(batch['_text_length']))
 
-        for key in ['image', 'view_position', '_label', '_topic', '_stop', '_temp']:
-            batch[key] = pack_padded_sequence(batch[key], length=batch['_text_length'])
+            for key in ['image', 'view_position', '_label', '_topic', '_stop', '_temp']:
+                batch[key] = pack_padded_sequence(batch[key], length=batch['_text_length'])
 
-        if is_val:
-            for key in ['text', 'label', 'stop', 'sent_length']:
-                batch[key] = pack_padded_sequence(batch[key], length=batch['text_length'])
+            if is_val:
+                for key in ['text', 'label', 'stop', 'sent_length']:
+                    batch[key] = pack_padded_sequence(batch[key], length=batch['text_length'])
 
-        if self.mode == Mode.full:
+        if self.mode in Mode.text_modes:
             batch.update(self.sentence_decoder._test(batch, beam_size=beam_size, alpha=alpha, beta=beta))
 
         return batch
@@ -197,7 +200,7 @@ class ReportDecoder(Module):
         self.label_size         = kwargs['label_size']
         self.embedding_size     = kwargs['embedding_size']
         self.hidden_size        = kwargs['hidden_size']
-        self.drop               = kwargs['dropout']
+        self.dropout            = kwargs['dropout']
         self.max_report_length  = kwargs['max_report_length']
 
         self.__use_continuous_label = kwargs['__use_continuous_label']
@@ -225,6 +228,7 @@ class ReportDecoder(Module):
 
         self.drop = Dropout(self.dropout)
 
+    @profile
     def _step(self, batch):
         x = torch.cat((
             [self.drop(batch['image_mean'])] +
@@ -316,7 +320,6 @@ class ReportDecoder(Module):
 
         return outputs
 
-    @profile
     def _test(self, batch):
         """
 
@@ -457,6 +460,7 @@ class SentenceDecoder(Module):
         self.fc_p = Linear(self.embedding_size, self.vocab_size)
         self.drop = Dropout(self.dropout)
 
+    @profile
     def _step(self, batch):
         text_embedding = self.word_embedding(batch['text'])
         x = torch.cat((
@@ -567,7 +571,6 @@ class SentenceDecoder(Module):
 
         return outputs
 
-    @profile
     def _test(self, batch, beam_size=4, alpha=0.65, beta=5.0):
         """
 

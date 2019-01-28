@@ -10,7 +10,7 @@ from gensim.models import Word2Vec, KeyedVectors
 from nltk.tokenize.punkt import PunktSentenceTokenizer
 from nltk.tokenize.casual import TweetTokenizer
 
-from torchvision.transforms import Compose, ToTensor
+from torchvision.transforms import Compose, ColorJitter, ToTensor
 
 from api import Phase, Token
 from api.metrics import CiderScorer
@@ -138,10 +138,15 @@ class MimicCXRDataset(torch.utils.data.Dataset):
 
             self.df_cache = torch.load(self._cider_cache_path())
 
-        # TODO(stmharry): ColorJitter
-        self.transform = Compose([
-            ToTensor(),
-        ])
+        if phase == Phase.train:
+            self.transform = Compose([
+                ColorJitter(brightness=0.5, contrast=0.5),
+                ToTensor(),
+            ])
+        else:
+            self.transform = Compose([
+                ToTensor(),
+            ])
 
     def __len__(self):
         return len(self.df)

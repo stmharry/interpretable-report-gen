@@ -11,17 +11,6 @@ def to_numpy(tensor):
     return tensor.detach().cpu().numpy()
 
 
-def sent_to_report(tensor, sent_length, text_length):
-    tensors = tensor.split(text_length.tolist(), 0)
-    sent_lengths = sent_length.split(text_length.tolist(), 0)
-
-    texts = [
-        pack_padded_sequence(tensor, length=sent_length)
-        for (tensor, sent_length) in zip(tensors, sent_lengths)
-    ]
-    return texts
-
-
 """ RNN
 """
 
@@ -63,23 +52,30 @@ def pad_sequence(sequences, batch_first=False, padding_value=0, total_length=Non
     return tensor
 
 
+def sent_to_reports(tensor, sent_length, text_length, index_to_word):
+    tensor = pack_padded_sequence(tensor, length=sent_length)
+    length = pad_packed_sequence(sent_length, length=text_length).sum(1)
+    tensors = tensor.split(length.tolist(), 0)
+
+    return [
+        [' '.join(index_to_word[index]) for index in tensor]
+        for tensor in tensors
+    ]
+
+
 """ Log
 """
-
 
 class SummaryWriter(tensorboardX.SummaryWriter):
     def add_log(self, log, prefix, global_step=None):
         for (key, value) in log.items():
             self.add_scalar(f'{prefix}/{key}', value, global_step=global_step)
 
-    def add_texts(self, texts, name, prefix, index_to_word, global_step=None):
+    def add_texts(self, texts, name, prefix, global_step=None):
         log_text = '\n'.join(
             ['| num | text |'] +
             ['|:---:|:-----|'] +
-            [
-                '|{}|{}|'.format(num_text, ' '.join([index_to_word[int(word)] for word in text]))
-                for (num_text, text) in enumerate(texts)
-            ]
+            ['|{}|{}|'.format(num_text, text) for (num_text, text) in enumerate(texts)]
         )
         self.add_text(f'{prefix}/{name}', log_text, global_step=global_step)
 
@@ -101,3 +97,12 @@ def version_of(ckpt_path):
         version = datetime.datetime.strptime(ckpt_dir, '%Y-%m-%d-%H%M%S-%f').timestamp()
 
     return version
+
+
+""" Misc
+"""
+
+def identity(func):
+    return func
+
+profile = __builtins__.get('profile', identity)

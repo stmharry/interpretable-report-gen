@@ -18,6 +18,7 @@ import json
 import logging
 import os
 import pandas as pd
+import sklearn.metrics
 import sys
 import torch
 import torch.utils.data
@@ -42,12 +43,14 @@ from api.data_loader import CollateFn
 from api.models import Model
 from api.utils import (
     SummaryWriter,
-    sent_to_report,
+    to_numpy,
+    sent_to_reports,
     pack_padded_sequence,
     pad_packed_sequence,
     pad_sequence,
     print_batch,
     version_of,
+    profile,
 )
 from api.metrics import (
     Bleu,
@@ -63,6 +66,7 @@ flags.DEFINE_enum('mode', None, Mode.__all__, 'Training mode (' + ' or '.join(ma
 flags.DEFINE_string('device', 'cuda', 'GPU device to use (default: "cuda")')
 flags.DEFINE_bool('debug', False, 'Turn on debug mode (default: False)')
 flags.DEFINE_bool('debug_subsample', False, 'Turn on subsampling for debugging (default: False)')
+flags.DEFINE_bool('profile', False, 'Turn on profiling mode (default: False)')
 
 """ Image
 """
@@ -100,28 +104,32 @@ flags.DEFINE_string('working_dir', os.getenv('WORKING_DIR'), 'Working directory 
 FLAGS = flags.FLAGS
 
 
+@profile
 def train():
     optimizer = torch.optim.Adam(model.parameters(), lr=FLAGS.lr)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, FLAGS.lr_decay_epochs, FLAGS.lr_decay)
 
     scorers = [Bleu(4), Rouge(), Cider(df_cache=train_dataset.df_cache)]
 
-    with open(os.path.join(working_dir, 'meta.json'), 'w') as f:
-        json.dump(FLAGS.flag_values_dict(), f, indent=4)
+    if FLAGS.do == 'train':
+        os.makedirs(working_dir)
+        with open(os.path.join(working_dir, 'meta.json'), 'w') as f:
+            json.dump(FLAGS.flag_values_dict(), f, indent=4)
 
-    torch.save(model, os.path.join(working_dir, f'model-init.pth'))
-    writer = SummaryWriter(working_dir)
-    logger.info(f'Writing to {working_dir}')
+        torch.save(model, os.path.join(working_dir, f'model-init.pth'))
+        writer = SummaryWriter(working_dir)
+        logger.info(f'Writing to {working_dir}')
 
-    num_epochs = {
-        'train': FLAGS.num_epochs,
-        'val': 1,
-    }[FLAGS.do]
+        num_epochs = FLAGS.num_epochs
+        phases = [Phase.train, Phase.val]
 
-    phases = {
-        'train': [Phase.train, Phase.val],
-        'val': [Phase.val]
-    }[FLAGS.do]
+    elif FLAGS.do == 'val':
+        num_epochs = 1
+        phases = [Phase.val]
+
+    if FLAGS.profile:
+        num_epochs = 1
+        phases = [Phase.train]
 
     """ Training Loop
     """
@@ -132,15 +140,12 @@ def train():
 
         for phase in phases:
             log = Log()
+            log_items = []
 
             if phase == Phase.train:
                 data_loader = train_loader
-                model.train()
             elif phase == Phase.val:
                 data_loader = val_loader
-                model.eval()
-
-                log_items = []
 
             prog = tqdm.tqdm(enumerate(data_loader), total=len(data_loader))
             for (num_batch, batch) in prog:
@@ -156,57 +161,62 @@ def train():
                 metrics = {}
 
                 if phase == Phase.train:
-                    batch = model(batch, phase=phase, teacher_forcing_ratio=teacher_forcing_ratio)
+                    output = model(batch, phase=Phase.train, teacher_forcing_ratio=teacher_forcing_ratio)
 
-                    if FLAGS.mode == Mode.debug:
-                        losses['label_ce'] = F.binary_cross_entropy(batch['_label'], batch['label'].sum(1).clamp(0, 1))
+                    if FLAGS.mode == Mode.debug_label:
+                        label = output['label'].sum(1).clamp(0, 1)
+                        _label = output['_label']
+                        losses['label_ce'] = F.binary_cross_entropy(_label, label)
 
-                    else:
-                        losses['label_ce'] = F.binary_cross_entropy(batch['_label'], batch['label'])
-                        losses['stop_bce'] = F.binary_cross_entropy(batch['_stop'], batch['stop'])
+                    elif FLAGS.mode in Mode.label_modes:
+                        reports = sent_to_reports(output['text'], sent_length=output['sent_length'], text_length=output['text_length'], index_to_word=train_dataset.index_to_word)
+                        _reports = sent_to_reports(output['_text'], sent_length=output['sent_length'], text_length=output['text_length'], index_to_word=train_dataset.index_to_word)
 
-                        if FLAGS.mode == Mode.full:
-                            text = pack_padded_sequence(batch['text'], length=batch['sent_length'])
-                            _text = pack_padded_sequence(batch['_text'], length=batch['sent_length'])
-                            _log_probability = pack_padded_sequence(batch['_log_probability'], length=batch['sent_length'])
+                        losses['label_ce'] = F.binary_cross_entropy(output['_label'], output['label'])
+                        losses['stop_bce'] = F.binary_cross_entropy(output['_stop'], output['stop'])
 
-                            losses['word_ce'] = F.nll_loss(_log_probability, text)
+                    if FLAGS.mode == Mode.pretrain:
+                        pass
+
+                    elif FLAGS.mode == Mode.teacher_forcing:
+                        word = pack_padded_sequence(output['text'], length=output['sent_length'])
+                        _log_probability = pack_padded_sequence(output['_log_probability'], length=output['sent_length'])
+
+                        losses['word_ce'] = F.nll_loss(_log_probability, word)
+
+                    elif FLAGS.mode == Mode.self_critical:
+                        _output = model(batch, phase=Phase.val, beam_size=1, alpha=FLAGS.alpha, beta=FLAGS.beta)
+                        import pdb; pdb.set_trace()
+                        _log_probability = pad_packed_sequence(_output['_log_probability'][:, 0], length=_output['_text_length'])
+                        _log_probability = _log_probability.sum(1)
+                        pass  # TODO(stmharry)
 
                 elif phase == Phase.val:
                     with torch.no_grad():
-                        batch = model(batch, phase=phase, beam_size=FLAGS.beam_size, alpha=FLAGS.alpha, beta=FLAGS.beta)
+                        output = model(batch, phase=Phase.val, beam_size=FLAGS.beam_size, alpha=FLAGS.alpha, beta=FLAGS.beta)
 
-                    if FLAGS.mode == Mode.debug:
-                        losses['label_ce'] = F.binary_cross_entropy(batch['_label'], batch['label'].sum(1).clamp(0, 1))
+                    if FLAGS.mode == Mode.debug_label:
+                        label = output['label'].sum(1).clamp(0, 1)
+                        _label = output['_label']
+                        losses['label_ce'] = F.binary_cross_entropy(_label, label)
 
                         log_items.extend([{
                             'label': l,
                             '_label': _l,
                         } for (l, _l) in zip(label, _label)])
 
-                    else:
-                        label = pad_packed_sequence(batch['label'], length=batch['text_length'])
-                        _label = pad_packed_sequence(batch['_label'], length=batch['_text_length'])
+                    elif FLAGS.mode in Mode.text_modes:
+                        reports = sent_to_reports(output['text'], sent_length=output['sent_length'], text_length=output['text_length'], index_to_word=train_dataset.index_to_word)
+                        _reports = sent_to_reports(output['_text'][:, 0], sent_length=output['_sent_length'][:, 0], text_length=output['_text_length'], index_to_word=train_dataset.index_to_word)
 
-                        if FLAGS.mode == Mode.full:
-                            # stmharry: -1 to account for <eos>
-                            texts = sent_to_report(batch['text'], sent_length=batch['sent_length'] - 1, text_length=batch['text_length'])
-                            _texts = sent_to_report(batch['_text'][:, 0], sent_length=batch['_sent_length'][:, 0] - 1, text_length=batch['_text_length'])
+                        for scorer in scorers:
+                            metrics = scorer(_reports, reports)
 
-                            gts = {}
-                            res = {}
-                            for (num, (text, _text)) in enumerate(zip(texts, _texts)):
-                                gts[num] = [' '.join([train_dataset.index_to_word[word] for word in text])]
-                                res[num] = [' '.join([train_dataset.index_to_word[word] for word in _text])]
-
-                            for scorer in scorers:
-                                (score, _) = scorer.compute_score(gts, res)
-
-                                if isinstance(score, list):
-                                    for (n, s) in enumerate(score):
-                                        metrics[f'{scorer.method()}-{n+1}'] = torch.tensor(s)
-                                else:
-                                    metrics[f'{scorer.method()}'] = torch.tensor(score)
+                            if isinstance(metrics, list):
+                                for (num, _metrics) in enumerate(metrics):
+                                    metrics[f'{scorer.method()}-{num + 1}'] = _metrics.mean().item()
+                            else:
+                                metrics[f'{scorer.method()}'] = metrics.mean().item()
 
                 if phase == Phase.train:
                     total_loss = sum(losses.values())
@@ -218,7 +228,7 @@ def train():
 
                 prog.set_description(', '.join(
                     [f'[{phase:5s}] Epoch {num_epoch:2d}'] +
-                    [f'{key:s}: {log[key]:8.2e}' for key in sorted(losses.keys())]
+                    [f'{key:s}: {log[key]:8.2e}' for key in losses.keys()]
                 ))
 
                 if phase == Phase.train:
@@ -227,33 +237,41 @@ def train():
                         writer.add_scalar(f'{phase}/teacher_forcing_ratio', teacher_forcing_ratio, global_step=num_step)
                         writer.add_log(_log, prefix=phase, global_step=num_step)
 
-                    if (num_step % FLAGS.log_text_steps == 0) and (FLAGS.mode == Mode.full):
-                        texts = sent_to_report(batch['text'], sent_length=batch['sent_length'], text_length=batch['text_length'])
-                        _texts = sent_to_report(batch['_text'], sent_length=batch['sent_length'], text_length=batch['text_length'])
+                    if (num_step % FLAGS.log_text_steps == 0) and (FLAGS.mode in Mode.text_modes):
+                        writer.add_texts(reports, 'text', prefix=phase, global_step=num_step)
+                        writer.add_texts(_reports, '_text', prefix=phase, global_step=num_step)
 
-                        writer.add_texts(texts, 'text', prefix=phase, index_to_word=train_dataset.index_to_word, global_step=num_step)
-                        writer.add_texts(_texts, '_text', prefix=phase, index_to_word=train_dataset.index_to_word, global_step=num_step)
+                if FLAGS.profile and (num_batch == 4):
+                    break
 
-            if phase == Phase.val:
-                if FLAGS.mode == Mode.debug:
+            if phase == Phase.train:
+                if num_epoch % FLAGS.save_epochs == 0:
+                    torch.save(model.state_dict(), os.path.join(working_dir, f'model-epoch-{num_epoch}.pth'))
+
+            elif phase == Phase.val:
+                if FLAGS.mode == Mode.debug_label:
                     (label, _label) = [
                         pad_sequence([item[key] for item in log_items], batch_first=True)
                         for key in ['label', '_label']
                     ]
-                    # TODO(stmharry): calculate AUC
+                    log.update({
+                        'AUCROC__macro_': sklearn.metrics.roc_auc_score(to_numpy(label), to_numpy(_label), average='macro'),
+                        'AUCROC__micro_': sklearn.metrics.roc_auc_score(to_numpy(label), to_numpy(_label), average='micro'),
+                        'AP__macro_': sklearn.metrics.average_precision_score(to_numpy(label), to_numpy(_label), average='macro'),
+                        'AP__micro_': sklearn.metrics.average_precision_score(to_numpy(label), to_numpy(_label), average='micro'),
+                    })
 
-                writer.add_log(log, prefix=phase, global_step=num_step)
+                if FLAGS.do == 'train':
+                    writer.add_log(log, prefix=phase, global_step=num_step)
 
-        if num_epoch % FLAGS.save_epochs == 0:
-            torch.save(model.state_dict(), os.path.join(working_dir, f'model-epoch-{num_epoch}.pth'))
+    if FLAGS.do == 'train':
+        writer.close()
 
-    if FLAGS.do == 'val':
+    elif FLAGS.do == 'val':
         logger.info(', '.join(
             [f'Log: '] +
-            [f'{key:s}: {log[key]:8.3e}' for key in sorted(log.keys())]
+            [f'{key:s}: {log[key]:8.2e}' for key in log.keys()]
         ))
-
-    writer.close()
 
 
 val = train
@@ -419,6 +437,7 @@ if __name__ == '__main__':
         batch_size=FLAGS.batch_size,
         num_workers=FLAGS.num_workers,
         collate_fn=CollateFn(sequence_fields=['text', 'label', 'stop', 'sent_length']),
+        pin_memory=True,
     )
     train_loader = DataLoader(
         dataset=train_dataset,
@@ -458,6 +477,5 @@ if __name__ == '__main__':
         working_dir = FLAGS.working_dir
 
     working_dir = os.path.join(working_dir, datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S-%f'))
-    os.makedirs(working_dir)
 
     locals()[FLAGS.do]()
