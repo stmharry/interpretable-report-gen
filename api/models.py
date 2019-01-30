@@ -13,6 +13,7 @@ from torch.nn import (
     Linear,
     Dropout,
 )
+from torch.distributions import Categorical
 from torchvision.models.resnet import (
     ResNet,
     Bottleneck,
@@ -50,13 +51,10 @@ def length_sorted_rnn(use_fields=None):
 class Module(_Module):
     def forward(self, batch, phase=None, **kwargs):
         if phase == Phase.train:
-            self.train()
             return self._train(batch, **kwargs)
         elif phase == Phase.val:
-            self.eval()
             return self._val(batch, **kwargs)
         elif phase == Phase.test:
-            self.eval()
             return self._test(batch, **kwargs)
 
 
@@ -81,62 +79,50 @@ class Model(Module):
         if self.mode in Mode.text_modes:
             self.sentence_decoder = SentenceDecoder(**kwargs)
 
-    def _map(self, batch, func, keys):
-        _batch = {}
-        for key in keys:
-            if key in batch:
-                _batch[key] = func(batch[key])
-
-        return _batch
-
     @profile
-    def _train(self, batch, teacher_forcing_ratio):
-        batch = batch.copy()
-        batch.update(self.image_encoder(batch))
+    def forward(self, batch, phase, **kwargs):
+        output = batch.copy()
+
+        if phase == Phase.train:
+            self.train()
+
+        elif phase in [Phase.val, Phase.test]:
+            self.eval()
+
+        output.update(self.image_encoder(output))
 
         if self.mode == Mode.debug_label:
-            batch['_label'] = torch.sigmoid(self.fc_label(self.drop(batch['image'].mean(1))))
+            output['_label'] = torch.sigmoid(self.fc_label(self.drop(output['image'].mean(1))))
 
         elif self.mode in Mode.label_modes:
-            batch.update(self.report_decoder._train(batch, length=batch['text_length'], teacher_forcing_ratio=teacher_forcing_ratio))
+            if (phase == Phase.train) and (self.mode in [Mode.pretrain, Mode.teacher_forcing]):
+                output.update(self.report_decoder._train(output, length=text_length, **kwargs))
+                _text_length = output['text_length']
+
+            elif (phase == Phase.train) and (self.mode == Mode.self_critical) or (phase in [Phase.val, Phase.test]):
+                output.update(self.report_decoder._test(output, **kwargs))
+                _text_length = output['_text_length']
 
             for key in ['image', 'view_position']:
-                batch[key] = expand_to_sequence(batch[key], length=torch.max(batch['text_length']))
-
-            for key in ['image', 'view_position', 'text', 'label', 'stop', 'sent_length', '_label', '_topic', '_stop', '_temp']:
-                batch[key] = pack_padded_sequence(batch[key], length=batch['text_length'])
-
-        if self.mode in Mode.text_modes:
-            batch.update(self.sentence_decoder._train(batch, length=batch['sent_length'], teacher_forcing_ratio=teacher_forcing_ratio))
-
-        return batch
-
-    def _val(self, batch, beam_size, alpha, beta, is_val=True):
-        batch = batch.copy()
-        batch.update(self.image_encoder(batch))
-
-        if self.mode == Mode.debug_label:
-            batch['_label'] = torch.sigmoid(self.fc_label(self.drop(batch['image'].mean(1))))
-
-        elif self.mode in Mode.label_modes:
-            batch.update(self.report_decoder._test(batch))
-
-            for key in ['image', 'view_position']:
-                batch[key] = expand_to_sequence(batch[key], length=torch.max(batch['_text_length']))
+                output[key] = expand_to_sequence(output[key], length=torch.max(_text_length))
 
             for key in ['image', 'view_position', '_label', '_topic', '_stop', '_temp']:
-                batch[key] = pack_padded_sequence(batch[key], length=batch['_text_length'])
+                output[key] = pack_padded_sequence(output[key], length=_text_length)
 
-            if is_val:
+            if phase in [Phase.train, Phase.val]:
                 for key in ['text', 'label', 'stop', 'sent_length']:
-                    batch[key] = pack_padded_sequence(batch[key], length=batch['text_length'])
+                    output[key] = pack_padded_sequence(output[key], length=output['text_length'])
 
-        if self.mode in Mode.text_modes:
-            batch.update(self.sentence_decoder._test(batch, beam_size=beam_size, alpha=alpha, beta=beta))
+            if (phase == Phase.train) and (self.mode == Mode.teacher_forcing):
+                output.update(self.sentence_decoder._train(output, length=output['sent_length'], **kwargs))
 
-        return batch
+            elif (phase == Phase.train) and (self.mode == Mode.self_critical):
+                output.update(self.sentence_decoder._test(output, probabilistic=True, **kwargs))
 
-    _test = functools.partialmethod(_val, is_val=False)
+            elif phase in [Phase.val, Phase.test]:
+                output.update(self.sentence_decoder._test(output, probabilistic=False, **kwargs))
+
+        return output
 
 
 class ImageEncoder(ResNet):
@@ -257,7 +243,7 @@ class ReportDecoder(Module):
 
     @length_sorted_rnn(use_fields=['image', 'view_position', 'label'])
     @profile
-    def _train(self, batch, length, teacher_forcing_ratio=1.0):
+    def _train(self, batch, length, **kwargs):
         """
 
         Args:
@@ -277,6 +263,8 @@ class ReportDecoder(Module):
         image         = batch['image']
         view_position = batch['view_position']
         label         = batch['label']
+
+        teacher_forcing_ratio = kwargs.get('teacher_forcing_ratio', 1.0)
 
         batch_size = len(image)
 
@@ -316,11 +304,11 @@ class ReportDecoder(Module):
 
             outputs.append({key: _batch[key] for key in ['_label', '_topic', '_stop', '_temp']})
 
-        outputs = {key: torch.nn.utils.rnn.pad_sequence([output[key] for output in outputs]) for key in outputs[0].keys()}
+        outputs = {key: pad_sequence([output[key] for output in outputs]) for key in outputs[0].keys()}
 
         return outputs
 
-    def _test(self, batch):
+    def _test(self, batch, **kwargs):
         """
 
         Args:
@@ -405,7 +393,7 @@ class ReportDecoder(Module):
             if is_end.all():
                 break
 
-        outputs = {key: torch.nn.utils.rnn.pad_sequence([output[key] for output in outputs], batch_first=True) for key in outputs[0].keys()}
+        outputs = {key: pad_sequence([output[key] for output in outputs], batch_first=True) for key in outputs[0].keys()}
 
         # Index the beams
         _index = outputs['_index'].squeeze(1).argsort(0)
@@ -418,6 +406,11 @@ class ReportDecoder(Module):
 
 
 class SentenceDecoder(Module):
+    class Mode:
+        teacher_forcing = 0
+        sample = 1
+        beam_search = 2
+
     def __init__(self, **kwargs):
         super(SentenceDecoder, self).__init__()
 
@@ -434,6 +427,7 @@ class SentenceDecoder(Module):
 
         self.__use_continuous_label = kwargs['__use_continuous_label']
         self.__no_recurrent_label   = kwargs['__no_recurrent_label']
+        self.__sample_text          = kwargs['__sample_text']
 
         self.vocab_size = len(self.word_to_index)
 
@@ -482,20 +476,18 @@ class SentenceDecoder(Module):
         c = torch.sum(a * torch.cat([batch['image'], s], 1), 1)
 
         _attention = a.squeeze(2)
-        _log_probability = F.log_softmax(self.fc_p(self.drop(c + hh.squeeze(1))) / batch['temp'], 1)
-        _text = _log_probability.argmax(1)
+        _logit = self.fc_p(self.drop(c + hh.squeeze(1))) / batch['temp']
 
         return {
             'h': h,
             'm': m,
             '_attention': _attention,
-            '_log_probability': _log_probability,
-            '_text': _text,
+            '_logit': _logit,
         }
 
     @length_sorted_rnn(use_fields=['image', 'view_position', 'text', 'label', '_topic', '_temp'])
     @profile
-    def _train(self, batch, length, teacher_forcing_ratio=1.0):
+    def _train(self, batch, length, **kwargs):
         """
 
         Args:
@@ -520,6 +512,8 @@ class SentenceDecoder(Module):
         topic         = batch['_topic']
         temp          = batch['_temp']
 
+        teacher_forcing_ratio = kwargs.get('teacher_forcing_ratio', 1.0)
+
         batch_size = len(image)
 
         image_mean = image.mean(1)
@@ -528,6 +522,7 @@ class SentenceDecoder(Module):
         m = torch.tanh(self.fc_m(self.drop(image_mean)))
 
         this_text = torch.full((batch_size,), self.word_to_index[Token.bos], dtype=torch.long).cuda()
+        _sum_log_probability = torch.zeros((batch_size,), dtype=torch.float).cuda()
 
         outputs = []
         for t in range(torch.max(length)):
@@ -548,30 +543,44 @@ class SentenceDecoder(Module):
                 'm': m[:batch_size_t],
             })
 
-            (h, m, _text) = [
+            (h, m, _logit) = [
                 _batch[key]
-                for key in ['h', 'm', '_text']
+                for key in ['h', 'm', '_logit']
             ]
+
+            categorical = Categorical(logits=_logit)
+
+            if self.__sample_text:
+                _text = categorical.sample()
+            else:
+                _text = _logit.argmax(1)
 
             this_text = torch.where(
                 torch.rand((batch_size_t,), dtype=torch.float).cuda() < teacher_forcing_ratio,
                 text[:batch_size_t, t],
                 _text,
             )
+            _sum_log_probability[:batch_size_t] += categorical.log_prob(_text)
 
-            outputs.append({key: _batch[key] for key in ['_attention', '_log_probability', '_text']})
+            outputs.append({
+                '_attention': _batch['attention'],
+                '_log_probability': categorical.probs.log(),
+                '_text': _text,
+            })
 
-        outputs.extend([{
-            '_attention': torch.zeros((0, self.image_size * self.image_size + 1), dtype=torch.float).cuda(),
-            '_log_probability': torch.zeros((0, self.vocab_size), dtype=torch.float).cuda(),
-            '_text': torch.zeros((0,), dtype=torch.float).cuda(),
-        }] * (self.max_sentence_length - int(torch.max(length))))
+        outputs = {
+            key: pad_sequence(
+                [output[key] for output in outputs],
+                total_length=self.max_sentence_length,
+            ) for key in outputs[0].keys()
+        }
 
-        outputs = {key: torch.nn.utils.rnn.pad_sequence([output[key] for output in outputs]) for key in outputs[0].keys()}
+        outputs['_sum_log_probability'] = _sum_log_probability
 
         return outputs
 
-    def _test(self, batch, beam_size=4, alpha=0.65, beta=5.0):
+    @profile
+    def _test(self, batch, probabilistic, **kwargs):
         """
 
         Args:
@@ -594,6 +603,10 @@ class SentenceDecoder(Module):
         topic         = batch['_topic']
         temp          = batch['_temp']
 
+        beam_size = kwargs.get('beam_size', 4)
+        alpha     = kwargs.get('alpha', 0.65)
+        beta      = kwargs.get('beta', 5.0)
+
         batch_size = len(image)
         batch_index = torch.arange(batch_size, dtype=torch.long).view(-1, 1).expand(-1, beam_size).reshape(-1).cuda()
 
@@ -606,7 +619,7 @@ class SentenceDecoder(Module):
 
         _text = torch.zeros((batch_size * beam_size, 0), dtype=torch.long).cuda()
         _attention = torch.zeros((batch_size * beam_size, 0, self.image_size * self.image_size + 1), dtype=torch.float).cuda()
-        _log_probability = torch.zeros((batch_size * beam_size,), dtype=torch.float).cuda()
+        _sum_log_probability = torch.zeros((batch_size * beam_size,), dtype=torch.float).cuda()
 
         outputs = []
         for t in range(self.max_sentence_length):
@@ -629,26 +642,36 @@ class SentenceDecoder(Module):
                 'm': m,
             })
 
-            (h, m, _this_attention, _this_log_probability) = [
+            (h, m, _this_attention, _logit) = [
                 _batch[key]
-                for key in ['h', 'm', '_attention', '_log_probability']
+                for key in ['h', 'm', '_attention', '_logit']
             ]
 
-            _log_probability = _log_probability.unsqueeze(1) + _this_log_probability
-            _log_probability = pad_packed_sequence(_log_probability, batch_length, padding_value=float('-inf'))
-            if t == 0:  # At t = 0, there is only one beam
-                _log_probability = _log_probability.narrow(1, 0, 1)
-            (_log_probability, _top_index) = _log_probability.view(batch_size, -1).topk(beam_size, 1)
+            categorical = Categorical(logits=_logit)
 
-            _log_probability = pack_padded_sequence(_log_probability, batch_length)
-            _index = pack_padded_sequence(_top_index / self.vocab_size + batch_begin.view(-1, 1), batch_length)
-            _this_text = pack_padded_sequence(_top_index % self.vocab_size, batch_length)
+            if probabilistic:
+                _this_text = categorical.sample()
+                _sum_log_probability += categorical.log_prob(_this_text)
+
+            else:
+                _sum_log_probability = _sum_log_probability.unsqueeze(1) + categorical.probs.log()
+                _sum_log_probability = pad_packed_sequence(_sum_log_probability, batch_length, padding_value=float('-inf'))
+                if t == 0:  # At t = 0, there is only one beam
+                    _sum_log_probability = _sum_log_probability.narrow(1, 0, 1)
+                (_sum_log_probability, _top_index) = _sum_log_probability.view(batch_size, -1).topk(beam_size, 1)
+
+                _sum_log_probability = pack_padded_sequence(_sum_log_probability, batch_length)
+                _index = pack_padded_sequence(_top_index / self.vocab_size + batch_begin.view(-1, 1), batch_length)
+                _this_text = pack_padded_sequence(_top_index % self.vocab_size, batch_length)
+
+                _text = _text[_index]
+                _attention = _attention[_index]
 
             if t == self.max_sentence_length - 1:
                 _this_text = torch.full((batch_size_t,), self.word_to_index[Token.eos], dtype=torch.long).cuda()
 
-            _text = torch.cat([_text[_index], _this_text.unsqueeze(1)], 1)
-            _attention = torch.cat([_attention[_index], _this_attention.unsqueeze(1)], 1)
+            _text = torch.cat([_text, _this_text.unsqueeze(1)], 1)
+            _attention = torch.cat([_attention, _this_attention.unsqueeze(1)], 1)
             _length = torch.full((batch_size_t, 1), t + 1, dtype=torch.long).cuda()
 
             is_end = (_this_text == self.word_to_index[Token.eos])
@@ -656,16 +679,16 @@ class SentenceDecoder(Module):
                 output = {
                     '_index': batch_index[is_end].unsqueeze(1),
                     '_attention': _attention[is_end],
-                    '_score': _log_probability[is_end].unsqueeze(1) / ((beta + t) / (beta + 1)) ** alpha,  # https://arxiv.org/pdf/1609.08144.pdf
-                    '_log_probability': _log_probability[is_end].unsqueeze(1),
+                    '_score': _sum_log_probability[is_end].unsqueeze(1) / ((beta + t) / (beta + 1)) ** alpha,  # https://arxiv.org/pdf/1609.08144.pdf
+                    '_sum_log_probability': _sum_log_probability[is_end].unsqueeze(1),
                     '_text': _text[is_end],
                     '_sent_length': _length[is_end],
                 }
                 outputs.extend([dict(zip(output.keys(), values)) for values in zip(*output.values())])
 
-                (batch_index, h, m, _log_probability, _this_text, _text) = [
+                (batch_index, h, m, _sum_log_probability, _this_text, _text, _attention) = [
                     value[~is_end]
-                    for value in [batch_index, h, m, _log_probability, _this_text, _text]
+                    for value in [batch_index, h, m, _sum_log_probability, _this_text, _text, _attention]
                 ]
 
             if is_end.all():
@@ -676,8 +699,7 @@ class SentenceDecoder(Module):
                 [output[key] for output in outputs],
                 batch_first=True,
                 total_length=self.max_sentence_length if key in ['_attention', '_text'] else None,
-            )
-            for key in outputs[0].keys()
+            ) for key in outputs[0].keys()
         }
 
         # Index the beams
@@ -691,7 +713,7 @@ class SentenceDecoder(Module):
 
         outputs.pop('_index')
         outputs['_score'] = outputs['_score'].squeeze(2)
-        outputs['_log_probability'] = outputs['_log_probability'].squeeze(2)
+        outputs['_sum_log_probability'] = outputs['_sum_log_probability'].squeeze(2)
         outputs['_sent_length'] = outputs['_sent_length'].squeeze(2)
 
         return outputs

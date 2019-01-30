@@ -1,4 +1,5 @@
 import numpy as np
+import torch
 
 from pyciderevalcap3.ciderD.ciderD import CiderD as _CiderD
 from pyciderevalcap3.ciderD.ciderD_scorer import CiderScorer as _CiderScorer
@@ -10,12 +11,9 @@ from pycocoevalcap3.spice.spice import Spice as _Spice
 
 class MetricMixin:
     def __call__(self, input_, target):
-        gts = {}
-        res = {}
-
         (_, scores) = self.compute_score(
-            dict(enumerate(target)),
-            dict(enumerate(input_)),
+            {num: [_target] for (num, _target) in enumerate(target)},
+            {num: [_input] for (num, _input) in enumerate(input_)},
         )
 
         return torch.as_tensor(scores, dtype=torch.float).cuda()

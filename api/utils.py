@@ -32,13 +32,13 @@ def pad_packed_sequence(tensor, length, padding_value=0):
 
 
 def pad_sequence(sequences, batch_first=False, padding_value=0, total_length=None):
-    total_length = total_length or max([sequence.size(0) for sequence in sequences])
+    max_length = max([sequence.size(0) for sequence in sequences])
     trailing_dims = sequences[0].size()[1:]
 
     if batch_first:
-        out_dims = (len(sequences), total_length) + trailing_dims
+        out_dims = (len(sequences), total_length or max_length) + trailing_dims
     else:
-        out_dims = (total_length, len(sequences)) + trailing_dims
+        out_dims = (max_length, total_length or len(sequences)) + trailing_dims
 
     tensor = torch.full(out_dims, padding_value, dtype=sequences[0].dtype).cuda()
     for (num, sequence) in enumerate(sequences):
@@ -52,19 +52,9 @@ def pad_sequence(sequences, batch_first=False, padding_value=0, total_length=Non
     return tensor
 
 
-def sent_to_reports(tensor, sent_length, text_length, index_to_word):
-    tensor = pack_padded_sequence(tensor, length=sent_length)
-    length = pad_packed_sequence(sent_length, length=text_length).sum(1)
-    tensors = tensor.split(length.tolist(), 0)
-
-    return [
-        [' '.join(index_to_word[index]) for index in tensor]
-        for tensor in tensors
-    ]
-
-
 """ Log
 """
+
 
 class SummaryWriter(tensorboardX.SummaryWriter):
     def add_log(self, log, prefix, global_step=None):

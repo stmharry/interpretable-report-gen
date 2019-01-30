@@ -14,6 +14,7 @@ from torchvision.transforms import Compose, ColorJitter, ToTensor
 
 from api import Phase, Token
 from api.metrics import CiderScorer
+from api.utils import to_numpy, pack_padded_sequence, pad_packed_sequence
 
 
 class MimicCXRDataset(torch.utils.data.Dataset):
@@ -126,7 +127,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
 
             word_vectors = KeyedVectors.load(self._word_embedding_path(field=field))
 
-            self.index_to_word = word_vectors.index2entity + [Token.unk]
+            self.index_to_word = np.array(word_vectors.index2entity + [Token.unk])
             self.word_to_index = dict(zip(self.index_to_word, range(len(self.index_to_word))))
             self.word_embedding = np.concatenate([
                 word_vectors.vectors,
@@ -210,3 +211,12 @@ class MimicCXRDataset(torch.utils.data.Dataset):
             })
 
         return _item
+
+    def convert_sentence(self, sent, sent_length, text_length):
+        word = pack_padded_sequence(sent, length=sent_length)
+        length = pad_packed_sequence(sent_length, length=text_length).sum(1)
+
+        word = self.index_to_word[to_numpy(word)]
+        words = np.split(word, np.cumsum(to_numpy(length)))[:-1]
+
+        return [' '.join(word) for word in words]

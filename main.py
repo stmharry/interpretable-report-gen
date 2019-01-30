@@ -1,6 +1,5 @@
 """ TODO """
 # Pretrained models for image embeddings
-# Reinforcement Learning on CIDEr
 
 # scenarios
 # - find best seqs to eval at test time
@@ -44,7 +43,6 @@ from api.models import Model
 from api.utils import (
     SummaryWriter,
     to_numpy,
-    sent_to_reports,
     pack_padded_sequence,
     pad_packed_sequence,
     pad_sequence,
@@ -95,8 +93,8 @@ flags.DEFINE_integer('save_epochs', 1, 'Save model per # epochs (default: 1)')
 flags.DEFINE_float('lr', 1e-3, 'Learning rate (default: 1e-3)')
 flags.DEFINE_float('lr_decay', 0.5, 'Learning rate decay (default: 0.5)')
 flags.DEFINE_integer('lr_decay_epochs', 8, 'Learning rate decay per # epochs (default: 8)')
-flags.DEFINE_float('tf_decay', 0.05, 'Teacher forcing ratio decay (default: 0.05)')
-flags.DEFINE_integer('tf_decay_epochs', 4, 'Teacher forcing ratio decay (default: 4)')
+flags.DEFINE_float('tf_decay', 0.0, 'Teacher forcing ratio decay (default: 0.0)')
+flags.DEFINE_integer('tf_decay_epochs', 8, 'Teacher forcing ratio decay (default: 8)')
 flags.DEFINE_integer('log_steps', 10, 'Logging per # steps for numerical values (default: 10)')
 flags.DEFINE_integer('log_text_steps', 100, 'Logging per # steps for text (default: 100)')
 flags.DEFINE_string('ckpt_path', None, 'Checkpoint path to load (default: None)')
@@ -109,7 +107,8 @@ def train():
     optimizer = torch.optim.Adam(model.parameters(), lr=FLAGS.lr)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, FLAGS.lr_decay_epochs, FLAGS.lr_decay)
 
-    scorers = [Bleu(4), Rouge(), Cider(df_cache=train_dataset.df_cache)]
+    cider = Cider(df_cache=train_dataset.df_cache)
+    scorers = [Bleu(4), Rouge(), cider]
 
     if FLAGS.do == 'train':
         os.makedirs(working_dir)
@@ -136,7 +135,12 @@ def train():
 
     for num_epoch in range(num_epochs):
         scheduler.step()
-        teacher_forcing_ratio = max(0, 1 - (num_epoch // FLAGS.tf_decay_epochs) * FLAGS.tf_decay)
+
+        if FLAGS.mode == Mode.teacher_forcing:
+            teacher_forcing_ratio = max(0, 1 - (num_epoch // FLAGS.tf_decay_epochs) * FLAGS.tf_decay)
+
+        elif FLAGS.mode == Mode.self_critical:
+            teacher_forcing_ratio = 0.0
 
         for phase in phases:
             log = Log()
@@ -144,6 +148,7 @@ def train():
 
             if phase == Phase.train:
                 data_loader = train_loader
+
             elif phase == Phase.val:
                 data_loader = val_loader
 
@@ -161,35 +166,43 @@ def train():
                 metrics = {}
 
                 if phase == Phase.train:
-                    output = model(batch, phase=Phase.train, teacher_forcing_ratio=teacher_forcing_ratio)
+                    if FLAGS.mode in [Mode.debug_label, Mode.pretrain, Mode.teacher_forcing]:
+                        output = model(batch, phase=Phase.train, teacher_forcing_ratio=teacher_forcing_ratio)
 
-                    if FLAGS.mode == Mode.debug_label:
-                        label = output['label'].sum(1).clamp(0, 1)
-                        _label = output['_label']
-                        losses['label_ce'] = F.binary_cross_entropy(_label, label)
+                        if FLAGS.mode == Mode.debug_label:
+                            losses['label_ce'] = F.binary_cross_entropy(output['_label'], output['label'].sum(1).clamp(0, 1))
 
-                    elif FLAGS.mode in Mode.label_modes:
-                        reports = sent_to_reports(output['text'], sent_length=output['sent_length'], text_length=output['text_length'], index_to_word=train_dataset.index_to_word)
-                        _reports = sent_to_reports(output['_text'], sent_length=output['sent_length'], text_length=output['text_length'], index_to_word=train_dataset.index_to_word)
+                        elif FLAGS.mode in [Mode.pretrain, Mode.teacher_forcing]:
+                            losses['label_ce'] = F.binary_cross_entropy(output['_label'], output['label'])
+                            losses['stop_bce'] = F.binary_cross_entropy(output['_stop'], output['stop'])
 
-                        losses['label_ce'] = F.binary_cross_entropy(output['_label'], output['label'])
-                        losses['stop_bce'] = F.binary_cross_entropy(output['_stop'], output['stop'])
+                        if FLAGS.mode == Mode.teacher_forcing:
+                            reports = train_dataset.convert_sentence(output['text'], output['sent_length'], output['text_length'])
+                            _reports = train_dataset.convert_sentence(output['_text'], output['sent_length'], output['text_length'])
 
-                    if FLAGS.mode == Mode.pretrain:
-                        pass
+                            word = pack_padded_sequence(output['text'], length=output['sent_length'])
+                            _log_probability = pack_padded_sequence(output['_log_probability'], length=output['sent_length'])
 
-                    elif FLAGS.mode == Mode.teacher_forcing:
-                        word = pack_padded_sequence(output['text'], length=output['sent_length'])
-                        _log_probability = pack_padded_sequence(output['_log_probability'], length=output['sent_length'])
-
-                        losses['word_ce'] = F.nll_loss(_log_probability, word)
+                            losses['word_ce'] = F.nll_loss(_log_probability, word)
 
                     elif FLAGS.mode == Mode.self_critical:
-                        _output = model(batch, phase=Phase.val, beam_size=1, alpha=FLAGS.alpha, beta=FLAGS.beta)
-                        import pdb; pdb.set_trace()
-                        _log_probability = pad_packed_sequence(_output['_log_probability'][:, 0], length=_output['_text_length'])
-                        _log_probability = _log_probability.sum(1)
-                        pass  # TODO(stmharry)
+                        output = model(batch, phase=Phase.train, beam_size=1)
+
+                        reports = train_dataset.convert_sentence(output['text'], output['sent_length'], output['text_length'])
+                        _reports = train_dataset.convert_sentence(output['_text'][:, 0], output['_sent_length'][:, 0], output['_text_length'])
+                        _sum_log_probability = pad_packed_sequence(output['_sum_log_probability'][:, 0], length=output['_text_length']).sum(1)
+
+                        with torch.no_grad():
+                            output_greedy = model(batch, phase=Phase.test, beam_size=1)
+                        _reports_greedy = train_dataset.convert_sentence(output_greedy['_text'][:, 0], output_greedy['_sent_length'][:, 0], output_greedy['_text_length'])
+
+                        metric = cider(_reports, reports)
+                        metric_greedy = cider(_reports_greedy, reports)
+                        reward = metric - metric_greedy
+
+                        losses['report_sc'] = - (_sum_log_probability * reward).mean()
+                        metrics['cider'] = metric.mean()
+                        metrics['reward'] = reward.mean()
 
                 elif phase == Phase.val:
                     with torch.no_grad():
@@ -198,6 +211,7 @@ def train():
                     if FLAGS.mode == Mode.debug_label:
                         label = output['label'].sum(1).clamp(0, 1)
                         _label = output['_label']
+
                         losses['label_ce'] = F.binary_cross_entropy(_label, label)
 
                         log_items.extend([{
@@ -206,17 +220,17 @@ def train():
                         } for (l, _l) in zip(label, _label)])
 
                     elif FLAGS.mode in Mode.text_modes:
-                        reports = sent_to_reports(output['text'], sent_length=output['sent_length'], text_length=output['text_length'], index_to_word=train_dataset.index_to_word)
-                        _reports = sent_to_reports(output['_text'][:, 0], sent_length=output['_sent_length'][:, 0], text_length=output['_text_length'], index_to_word=train_dataset.index_to_word)
+                        reports = train_dataset.convert_sentence(output['text'], output['sent_length'], output['text_length'])
+                        _reports = train_dataset.convert_sentence(output['_text'][:, 0], output['_sent_length'][:, 0], output['_text_length'])
 
                         for scorer in scorers:
-                            metrics = scorer(_reports, reports)
+                            metric = scorer(_reports, reports)
 
-                            if isinstance(metrics, list):
-                                for (num, _metrics) in enumerate(metrics):
-                                    metrics[f'{scorer.method()}-{num + 1}'] = _metrics.mean().item()
+                            if metric.dim() == 2:
+                                for (num, _metric) in enumerate(metric):
+                                    metrics[f'{scorer.method()}-{num + 1}'] = _metric.mean().item()
                             else:
-                                metrics[f'{scorer.method()}'] = metrics.mean().item()
+                                metrics[f'{scorer.method()}'] = metric.mean().item()
 
                 if phase == Phase.train:
                     total_loss = sum(losses.values())
@@ -241,7 +255,7 @@ def train():
                         writer.add_texts(reports, 'text', prefix=phase, global_step=num_step)
                         writer.add_texts(_reports, '_text', prefix=phase, global_step=num_step)
 
-                if FLAGS.profile and (num_batch == 4):
+                if FLAGS.profile and (num_batch == 32):
                     break
 
             if phase == Phase.train:
@@ -284,7 +298,6 @@ def test():
         Phase.test: (test_loader, test_dataset),
     }[FLAGS.test_split]
 
-    model.eval()
     log = Log()
 
     prog = tqdm.tqdm(enumerate(data_loader), total=len(data_loader))
@@ -292,11 +305,11 @@ def test():
         for (key, value) in batch.items():
             batch[key] = value.to(device)
 
-        with torch.no_grad():
-            batch = model(batch, phase=phase, beam_size=FLAGS.beam_size, alpha=FLAGS.alpha, beta=FLAGS.beta)
-
         losses = {}
         metrics = {}
+
+        with torch.no_grad():
+            batch = model(batch, phase=phase, beam_size=FLAGS.beam_size, alpha=FLAGS.alpha, beta=FLAGS.beta)
 
         _log = {**losses, **metrics}
         log.update(_log)
@@ -307,20 +320,20 @@ def test():
         ))
 
         if FLAGS.test_split == 'val':
-            texts = sent_to_report(batch['text'], sent_length=batch['sent_length'], text_length=batch['text_length'])
+            report_texts = train_dataset.convert_sentence(batch['text'], batch['sent_length'], batch['text_length'])
 
         item_index = batch['item_index']
         _text_length = batch['_text_length']  # (num_reports,)
         (
-            _stop,             # (num_reports, max_num_sentences, 1)
-            _temp,             # (num_reports, max_num_sentences, 1)
-            _score,            # (num_reports, max_num_sentences, beam_size)
-            _log_probability,  # (num_reports, max_num_sentences, beam_size)
-            _text,             # (num_reports, max_num_sentences, beam_size, max_num_words)
-            _sent_length,      # (num_reports, max_num_sentences, beam_size)
+            _stop,                 # (num_reports, max_num_sentences, 1)
+            _temp,                 # (num_reports, max_num_sentences, 1)
+            _score,                # (num_reports, max_num_sentences, beam_size)
+            _sum_log_probability,  # (num_reports, max_num_sentences, beam_size)
+            _text,                 # (num_reports, max_num_sentences, beam_size, max_num_words)
+            _sent_length,          # (num_reports, max_num_sentences, beam_size)
         ) = [
             pad_packed_sequence(batch[key], length=_text_length)
-            for key in ['_stop', '_temp', '_score', '_log_probability', '_text', '_sent_length']
+            for key in ['_stop', '_temp', '_score', '_sum_log_probability', '_text', '_sent_length']
         ]
 
         reports = []
@@ -335,11 +348,11 @@ def test():
                     num_words = _sent_length[num_report, num_sentence, num_beam]
                     _sentence = _text[num_report, num_sentence, num_beam]
 
-                    beam_text = ' '.join([train_dataset.index_to_word[_sentence[num_word]] for num_word in range(num_words)])
+                    beam_text = ' '.join(train_dataset.index_to_word[to_numpy(_sentence[:num_words])])
 
                     beams.append({
                         'score': '{:.2f}'.format(float(_score[num_report, num_sentence, num_beam])),
-                        'log_prob': '{:.2f}'.format(float(_log_probability[num_report, num_sentence, num_beam])),
+                        'log_prob': '{:.2f}'.format(float(_sum_log_probability[num_report, num_sentence, num_beam])),
                         'text': str(html.escape(beam_text)),
                     })
 
@@ -354,7 +367,7 @@ def test():
                 'generated text': sentences,
             }
             if FLAGS.test_split == 'val':
-                report['ground truth text'] = ' '.join([train_dataset.index_to_word[word] for word in texts[num_report]])
+                report['ground truth text'] = report_texts[num_report]
 
             reports.append(report)
 
@@ -365,6 +378,7 @@ def test():
     s = head(link(rel='stylesheet', href='https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/css/bootstrap.min.css')) + \
         body(div(div(div(HTML(s), _class='panel-body'), _class='panel panel-default'), _class='container'))
 
+    os.makedirs(working_dir)
     with open(os.path.join(working_dir, 'index.html'), 'w') as f:
         f.write(s)
 
@@ -407,9 +421,9 @@ if __name__ == '__main__':
     test_df = df[df.subject_id.isin(mimic_cxr.test_subject_ids)]
 
     if FLAGS.debug_subsample:
-        train_df = train_df.iloc[:16]
+        train_df = train_df.iloc[:128]
         val_df = val_df.iloc[:128]
-        test_df = test_df.iloc[:16]
+        test_df = test_df.iloc[:128]
 
     Dataset = functools.partial(
         MimicCXRDataset,
@@ -462,6 +476,7 @@ if __name__ == '__main__':
         '__use_continuous_label': version_of(FLAGS.ckpt_path) > 1548152415,
         '__no_recurrent_label': version_of(FLAGS.ckpt_path) > 1548347568,
         '__image_encoder_relu': version_of(FLAGS.ckpt_path) > 1548428102,
+        '__sample_text': version_of(FLAGS.ckpt_path) > 1548708003,
     })
 
     model = DataParallel(Model(**kwargs)).to(device)
