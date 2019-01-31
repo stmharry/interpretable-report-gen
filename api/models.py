@@ -1,6 +1,7 @@
 import functools
 import logging
 import os
+import re
 import torch
 import torch.nn.functional as F
 
@@ -11,13 +12,14 @@ from torch.nn import (
     Conv2d,
     Embedding,
     Linear,
+    ReLU,
     Dropout,
 )
-from torch.distributions import Categorical
 from torchvision.models.resnet import (
     ResNet,
     Bottleneck,
 )
+from torchvision.models.densenet import DenseNet
 
 from api import Mode, Phase, Token
 from api.utils import (
@@ -48,6 +50,22 @@ def length_sorted_rnn(use_fields=None):
     return _length_sorted_rnn
 
 
+class Categorical(object):
+    def __init__(self, logits):
+        self.logits = logits
+
+    def sample(self):
+        u = torch.rand_like(self.logits)
+        z = self.logits - torch.log(-u.log())
+        return z.argmax(1)
+
+    def argmax(self):
+        return self.logits.argmax(1)
+
+    def log_prob(self, x):
+        return self.logits.gather(1, x.unsqueeze(1)).squeeze(1)
+
+
 class Module(_Module):
     def forward(self, batch, phase=None, **kwargs):
         if phase == Phase.train:
@@ -67,7 +85,14 @@ class Model(Module):
         self.label_size     = kwargs['label_size']
         self.dropout        = kwargs['dropout']
 
-        self.image_encoder = ImageEncoder(**kwargs)
+        self.__use_densenet = kwargs['__use_densenet']
+
+        if self.__use_densenet:
+            self.image_encoder = DenseNet121(**kwargs)
+            path = os.path.join(os.path.dirname(__file__), os.pardir, 'checkpoints', 'model.pkl')
+            self.image_encoder.load_state_dict(torch.load(path)['state_dict'])
+        else:
+            self.image_encoder = ResNet50(**kwargs)
 
         if self.mode == Mode.debug_label:
             self.fc_label = Linear(self.embedding_size, self.label_size)
@@ -94,9 +119,9 @@ class Model(Module):
         if self.mode == Mode.debug_label:
             output['_label'] = torch.sigmoid(self.fc_label(self.drop(output['image'].mean(1))))
 
-        elif self.mode in Mode.label_modes:
-            if (phase == Phase.train) and (self.mode in [Mode.pretrain, Mode.teacher_forcing]):
-                output.update(self.report_decoder._train(output, length=text_length, **kwargs))
+        if self.mode in Mode.label_modes:
+            if (phase == Phase.train) and (self.mode in [Mode.auto_regress, Mode.teacher_forcing]):
+                output.update(self.report_decoder._train(output, length=output['text_length'], **kwargs))
                 _text_length = output['text_length']
 
             elif (phase == Phase.train) and (self.mode == Mode.self_critical) or (phase in [Phase.val, Phase.test]):
@@ -125,11 +150,11 @@ class Model(Module):
         return output
 
 
-class ImageEncoder(ResNet):
+class ResNet50(ResNet):
     image_embedding_size = 2048
 
     def __init__(self, **kwargs):
-        super(ImageEncoder, self).__init__(Bottleneck, [3, 4, 6, 3])
+        super(ResNet50, self).__init__(Bottleneck, [3, 4, 6, 3])
 
         self.image_size     = kwargs['image_size']
         self.embedding_size = kwargs['embedding_size']
@@ -173,6 +198,49 @@ class ImageEncoder(ResNet):
         if self.__image_encoder_relu:
             image = self.relu(image)
 
+        image = image.view(-1, self.embedding_size, self.image_size * self.image_size).transpose(1, 2)
+
+        return {'image': image}
+
+
+class DenseNet121(DenseNet):
+    image_embedding_size = 1024
+
+    def __init__(self, **kwargs):
+        super(DenseNet121, self).__init__(num_init_features=64, growth_rate=32, block_config=(6, 12, 24, 16))
+
+        self.image_size     = kwargs['image_size']
+        self.embedding_size = kwargs['embedding_size']
+        self.dropout        = kwargs['dropout']
+
+        self.avgpool = AdaptiveAvgPool2d((self.image_size, self.image_size))
+        self.fc = Conv2d(self.image_embedding_size, self.embedding_size, (1, 1))
+        self.drop = Dropout(self.dropout)
+        self.relu = ReLU(inplace=True)
+
+    def load_state_dict(self, state_dict, strict=False):
+        pattern = re.compile(r'^(.*denselayer\d+\.(?:norm|relu|conv))\.((?:[12])\.(?:weight|bias|running_mean|running_var))$')
+
+        _state_dict = {}
+        for key in state_dict.keys():
+            match = pattern.match(key)
+            _key = (match.group(1) + match.group(2)) if match else key
+
+            _state_dict[_key[19:]] = state_dict[key]  # module.densenet121.*
+
+        super(DenseNet121, self).load_state_dict(_state_dict, strict=strict)
+
+    @profile
+    def forward(self, batch):
+        image = batch['image']
+
+        image = self.features(image)
+        image = self.relu(image)
+
+        image = self.avgpool(image)
+        image = self.drop(image)
+        image = self.fc(image)
+        image = self.relu(image)
         image = image.view(-1, self.embedding_size, self.image_size * self.image_size).transpose(1, 2)
 
         return {'image': image}
@@ -277,7 +345,7 @@ class ReportDecoder(Module):
 
         outputs = []
         for t in range(torch.max(length)):
-            batch_size_t = torch.sum(length > t)
+            batch_size_t = torch.sum(length > t).item()
 
             logger.debug(f'ReportDecoder.forward(): time_step={t}, num_reports={batch_size_t}')
 
@@ -406,11 +474,6 @@ class ReportDecoder(Module):
 
 
 class SentenceDecoder(Module):
-    class Mode:
-        teacher_forcing = 0
-        sample = 1
-        beam_search = 2
-
     def __init__(self, **kwargs):
         super(SentenceDecoder, self).__init__()
 
@@ -428,6 +491,7 @@ class SentenceDecoder(Module):
         self.__use_continuous_label = kwargs['__use_continuous_label']
         self.__no_recurrent_label   = kwargs['__no_recurrent_label']
         self.__sample_text          = kwargs['__sample_text']
+        self.__no_temp              = kwargs['__no_temp']
 
         self.vocab_size = len(self.word_to_index)
 
@@ -476,13 +540,16 @@ class SentenceDecoder(Module):
         c = torch.sum(a * torch.cat([batch['image'], s], 1), 1)
 
         _attention = a.squeeze(2)
-        _logit = self.fc_p(self.drop(c + hh.squeeze(1))) / batch['temp']
+        _logit = self.fc_p(self.drop(c + hh.squeeze(1)))
+        if not self.__no_temp:
+            _logit = _logit / batch['temp']
+        _log_probability = F.log_softmax(_logit, 1)
 
         return {
             'h': h,
             'm': m,
             '_attention': _attention,
-            '_logit': _logit,
+            '_log_probability': _log_probability,
         }
 
     @length_sorted_rnn(use_fields=['image', 'view_position', 'text', 'label', '_topic', '_temp'])
@@ -526,7 +593,7 @@ class SentenceDecoder(Module):
 
         outputs = []
         for t in range(torch.max(length)):
-            batch_size_t = torch.sum(length > t)
+            batch_size_t = torch.sum(length > t).item()
 
             logger.debug(f'SentenceDecoder.forward(): time_step={t}, num_sentences={batch_size_t}')
 
@@ -543,17 +610,17 @@ class SentenceDecoder(Module):
                 'm': m[:batch_size_t],
             })
 
-            (h, m, _logit) = [
+            (h, m, _log_probability) = [
                 _batch[key]
-                for key in ['h', 'm', '_logit']
+                for key in ['h', 'm', '_log_probability']
             ]
 
-            categorical = Categorical(logits=_logit)
+            categorical = Categorical(logits=_log_probability)
 
             if self.__sample_text:
                 _text = categorical.sample()
             else:
-                _text = _logit.argmax(1)
+                _text = categorical.argmax()
 
             this_text = torch.where(
                 torch.rand((batch_size_t,), dtype=torch.float).cuda() < teacher_forcing_ratio,
@@ -563,8 +630,8 @@ class SentenceDecoder(Module):
             _sum_log_probability[:batch_size_t] += categorical.log_prob(_text)
 
             outputs.append({
-                '_attention': _batch['attention'],
-                '_log_probability': categorical.probs.log(),
+                '_attention': _batch['_attention'],
+                '_log_probability': _log_probability,
                 '_text': _text,
             })
 
@@ -642,19 +709,19 @@ class SentenceDecoder(Module):
                 'm': m,
             })
 
-            (h, m, _this_attention, _logit) = [
+            (h, m, _this_attention, _log_probability) = [
                 _batch[key]
-                for key in ['h', 'm', '_attention', '_logit']
+                for key in ['h', 'm', '_attention', '_log_probability']
             ]
 
-            categorical = Categorical(logits=_logit)
+            categorical = Categorical(logits=_log_probability)
 
             if probabilistic:
                 _this_text = categorical.sample()
-                _sum_log_probability += categorical.log_prob(_this_text)
+                _sum_log_probability = _sum_log_probability + categorical.log_prob(_this_text)
 
             else:
-                _sum_log_probability = _sum_log_probability.unsqueeze(1) + categorical.probs.log()
+                _sum_log_probability = _sum_log_probability.unsqueeze(1) + _log_probability
                 _sum_log_probability = pad_packed_sequence(_sum_log_probability, batch_length, padding_value=float('-inf'))
                 if t == 0:  # At t = 0, there is only one beam
                     _sum_log_probability = _sum_log_probability.narrow(1, 0, 1)

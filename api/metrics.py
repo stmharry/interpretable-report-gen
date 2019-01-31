@@ -34,7 +34,7 @@ class CiderD(_CiderD, MetricMixin):
     def compute_score(self, gts, res):
         cider_scorer = CiderScorer(n=self._n, sigma=self._sigma)
         cider_scorer.document_frequency = self.df_cache['document_frequency']
-        cider_scorer.ref_len = np.log(float(self.df_cache['ref_len']))
+        cider_scorer.ref_len = self.df_cache['ref_len']
 
         for id in gts:
             cider_scorer += (res[id][0], gts[id])

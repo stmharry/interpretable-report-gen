@@ -10,7 +10,7 @@ from gensim.models import Word2Vec, KeyedVectors
 from nltk.tokenize.punkt import PunktSentenceTokenizer
 from nltk.tokenize.casual import TweetTokenizer
 
-from torchvision.transforms import Compose, ColorJitter, ToTensor
+from torchvision.transforms import Lambda, Resize, Compose, ColorJitter, ToTensor, Normalize
 
 from api import Phase, Token
 from api.metrics import CiderScorer
@@ -36,16 +36,16 @@ class MimicCXRDataset(torch.utils.data.Dataset):
                 [Token.eos]
             )
 
-    def _sentence_label_path(self, field):
-        return os.path.join(os.getenv('CACHE_DIR'), f'sentence-label-field-{field}.tsv')
+    def _sentence_label_path(self):
+        return os.path.join(os.getenv('CACHE_DIR'), f'sentence-label-field-{self.field}.tsv')
 
-    def _make_sentence_label(self, field):
+    def _make_sentence_label(self):
         def _tokenize_join(sentence):
             return ' '.join(self.word_tokenizer.tokenize(sentence))
 
         df = self.df.drop_duplicates('rad_id')[['rad_id', 'text']]
 
-        df_regex_path = os.path.join(os.path.dirname(__file__), os.pardir, 'data', 'labels.tsv')
+        df_regex_path = os.path.join(os.getenv('CACHE_DIR'), 'labels.tsv')
         df_regex = pd.read_csv(df_regex_path, delimiter='\t')
         regexes = df_regex.groupby('label', sort=False)['regex'].aggregate('|'.join)
 
@@ -70,14 +70,14 @@ class MimicCXRDataset(torch.utils.data.Dataset):
             _dfs.append(pd.concat(_series, axis=1))
 
         _df = pd.concat(_dfs)
-        _df.to_csv(self._sentence_label_path(field=field), index=False, sep='\t')
+        _df.to_csv(self._sentence_label_path(), index=False, sep='\t')
 
-    def _word_embedding_path(self, field):
-        return os.path.join(os.getenv('CACHE_DIR'), f'word-embedding-field-{field}.pkl')
+    def _word_embedding_path(self):
+        return os.path.join(os.getenv('CACHE_DIR'), f'word-embedding-field-{self.field}.pkl')
 
-    def _make_word_embedding(self, field):
+    def _make_word_embedding(self):
         word2vec = Word2Vec(self, size=self.embedding_size, min_count=self.min_word_freq, workers=24)
-        word2vec.wv.save(self._word_embedding_path(field=field))
+        word2vec.wv.save(self._word_embedding_path())
 
     def _cider_cache_path(self):
         return os.path.join(os.getenv('CACHE_DIR'), f'cider-cache.pkl')
@@ -89,7 +89,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         cider_scorer.compute_doc_freq()
         torch.save({
             'document_frequency': cider_scorer.document_frequency,
-            'rel_freq': len(cider_scorer.crefs),
+            'ref_len': np.log(float(len(cider_scorer.crefs))),
         }, self._cider_cache_path())
 
     def __init__(self,
@@ -99,9 +99,11 @@ class MimicCXRDataset(torch.utils.data.Dataset):
                  max_report_length,
                  max_sentence_length,
                  embedding_size,
-                 phase):
+                 phase,
+                 kwargs):
 
         self.df = df
+        self.field = field
         self.min_word_freq = min_word_freq
         self.max_report_length = max_report_length
         self.max_sentence_length = max_sentence_length
@@ -112,21 +114,27 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         self.word_tokenizer = TweetTokenizer()
 
         self.view_position_size = max(self.view_position_to_index.values()) + 1
-        # self.view_position_size = 2 * self.view_position_size  # TODO(stmharry): this is a bug
 
-        if (phase == Phase.train) or (phase == Phase.val):
-            if not os.path.isfile(self._sentence_label_path(field=field)):
-                self._make_sentence_label(field=field)
+        if phase is None:
+            if not os.path.isfile(self._sentence_label_path()):
+                self._make_sentence_label()
 
-            self.df_sentence_label = pd.read_csv(self._sentence_label_path(field=field), sep='\t', dtype={'rad_id': str}).set_index('rad_id')
+        if (phase is None) or (phase == Phase.train) or (phase == Phase.val):
+            self.df_sentence_label = pd.read_csv(self._sentence_label_path(), sep='\t', dtype={'rad_id': str}).set_index('rad_id')
             self.label_columns = [column for column in self.df_sentence_label.columns if column.startswith('label_')]
             self.label_size = len(self.label_columns)
 
-            if not os.path.isfile(self._word_embedding_path(field=field)):
-                self._make_word_embedding(field=field)
+        if phase is None:
+            if not os.path.isfile(self._cider_cache_path()):
+                self._make_cider_cache()
 
-            word_vectors = KeyedVectors.load(self._word_embedding_path(field=field))
+            self.df_cache = torch.load(self._cider_cache_path())
 
+        if phase == Phase.train:
+            if not os.path.isfile(self._word_embedding_path()):
+                self._make_word_embedding()
+
+            word_vectors = KeyedVectors.load(self._word_embedding_path())
             self.index_to_word = np.array(word_vectors.index2entity + [Token.unk])
             self.word_to_index = dict(zip(self.index_to_word, range(len(self.index_to_word))))
             self.word_embedding = np.concatenate([
@@ -134,20 +142,25 @@ class MimicCXRDataset(torch.utils.data.Dataset):
                 np.zeros((1, embedding_size)),
             ], axis=0).astype(np.float32)
 
-            if not os.path.isfile(self._cider_cache_path()):
-                self._make_cider_cache()
-
-            self.df_cache = torch.load(self._cider_cache_path())
-
         if phase == Phase.train:
-            self.transform = Compose([
-                ColorJitter(brightness=0.5, contrast=0.5),
-                ToTensor(),
-            ])
+            jitter = [ColorJitter(brightness=0.5, contrast=0.5)]
         else:
-            self.transform = Compose([
-                ToTensor(),
-            ])
+            jitter = []
+
+        if kwargs['__use_densenet']:
+            self.transform = Compose((
+                [Lambda(lambda img: img.convert('RGB'))] +
+                [Resize(256)] +
+                jitter +
+                [ToTensor()] +
+                [Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])]
+            ))
+        else:
+            self.transform = Compose((
+                [Resize(256)] +
+                jitter +
+                [ToTensor()]
+            ))
 
     def __len__(self):
         return len(self.df)
