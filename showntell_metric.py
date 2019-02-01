@@ -38,3 +38,5 @@ metrics = {
     key: torch.mean([metric[key] for metric in metrics])
     for key in metrics[0].keys()
 }
+
+print(metrics)
