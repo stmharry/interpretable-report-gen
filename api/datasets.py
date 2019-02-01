@@ -115,32 +115,28 @@ class MimicCXRDataset(torch.utils.data.Dataset):
 
         self.view_position_size = max(self.view_position_to_index.values()) + 1
 
-        if phase is None:
-            if not os.path.isfile(self._sentence_label_path()):
-                self._make_sentence_label()
+        if phase is None and (not os.path.isfile(self._sentence_label_path())):
+            self._make_sentence_label()
 
-        if (phase is None) or (phase == Phase.train) or (phase == Phase.val):
-            self.df_sentence_label = pd.read_csv(self._sentence_label_path(), sep='\t', dtype={'rad_id': str}).set_index('rad_id')
-            self.label_columns = [column for column in self.df_sentence_label.columns if column.startswith('label_')]
-            self.label_size = len(self.label_columns)
+        self.df_sentence_label = pd.read_csv(self._sentence_label_path(), sep='\t', dtype={'rad_id': str}).set_index('rad_id')
+        self.label_columns = [column for column in self.df_sentence_label.columns if column.startswith('label_')]
+        self.label_size = len(self.label_columns)
 
-        if phase is None:
-            if not os.path.isfile(self._cider_cache_path()):
-                self._make_cider_cache()
+        if phase is None and (not os.path.isfile(self._cider_cache_path())):
+            self._make_cider_cache()
 
-            self.df_cache = torch.load(self._cider_cache_path())
+        self.df_cache = torch.load(self._cider_cache_path())
 
-        if phase == Phase.train:
-            if not os.path.isfile(self._word_embedding_path()):
-                self._make_word_embedding()
+        if (phase == Phase.train) and (not os.path.isfile(self._word_embedding_path())):
+            self._make_word_embedding()
 
-            word_vectors = KeyedVectors.load(self._word_embedding_path())
-            self.index_to_word = np.array(word_vectors.index2entity + [Token.unk])
-            self.word_to_index = dict(zip(self.index_to_word, range(len(self.index_to_word))))
-            self.word_embedding = np.concatenate([
-                word_vectors.vectors,
-                np.zeros((1, embedding_size)),
-            ], axis=0).astype(np.float32)
+        word_vectors = KeyedVectors.load(self._word_embedding_path())
+        self.index_to_word = np.array(word_vectors.index2entity + [Token.unk])
+        self.word_to_index = dict(zip(self.index_to_word, range(len(self.index_to_word))))
+        self.word_embedding = np.concatenate([
+            word_vectors.vectors,
+            np.zeros((1, embedding_size)),
+        ], axis=0).astype(np.float32)
 
         if phase == Phase.train:
             jitter = [ColorJitter(brightness=0.5, contrast=0.5)]
