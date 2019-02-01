@@ -35,7 +35,7 @@ for item in tqdm.tqdm(df.itertuples(), total=len(df)):
     metrics.append(metric)
 
 metrics = {
-    key: torch.mean([metric[key] for metric in metrics])
+    key: torch.mean(torch.FloatTensor([metric[key] for metric in metrics]))
     for key in metrics[0].keys()
 }
 
