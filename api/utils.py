@@ -1,4 +1,5 @@
 import datetime
+import json
 import logging
 import tensorboardX
 import torch
@@ -79,12 +80,18 @@ def print_batch(batch, logger=None):
 """ Version
 """
 
-def version_of(ckpt_path):
+def version_of(ckpt_path, ascend=False):
     if ckpt_path is None:
         version = datetime.datetime.now().timestamp()
     else:
-        ckpt_dir = os.path.basename(os.path.dirname(ckpt_path))
-        version = datetime.datetime.strptime(ckpt_dir, '%Y-%m-%d-%H%M%S-%f').timestamp()
+        ckpt_dir = os.path.dirname(ckpt_path)
+        with open(os.path.join(ckpt_dir, 'meta.json'), 'r') as f:
+            ckpt_path = json.load(f).get('ckpt_path')
+
+        if ckpt_path is None or (not ascend):
+            version = datetime.datetime.strptime(os.path.basename(ckpt_dir), '%Y-%m-%d-%H%M%S-%f').timestamp()
+        else:
+            version = version_of(ckpt_path)
 
     return version
 

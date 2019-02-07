@@ -58,10 +58,11 @@ from api.metrics import (
 """
 flags.DEFINE_string('do', 'train', 'Function to execute (default: "train")')
 flags.DEFINE_enum('test_split', 'test', ['val', 'test'], 'Split to test for')
-flags.DEFINE_enum('mode', None, Mode.__all__, 'Training mode (' + ' or '.join(map('"{}"'.format, Mode.__all__)) + ')')
+flags.DEFINE_enum('mode', None, list(Mode.__members__.keys()), 'Training mode (' + ' or '.join(map('"{}"'.format, Mode.__members__)) + ')')
 flags.DEFINE_string('device', 'cuda', 'GPU device to use (default: "cuda")')
 flags.DEFINE_bool('debug', False, 'Turn on debug mode (default: False)')
 flags.DEFINE_bool('debug_subsample', False, 'Turn on subsampling for debugging (default: False)')
+flags.DEFINE_bool('debug_one_sentence', False, 'Turn on one-sentence generating mode (default: False)')
 flags.DEFINE_bool('profile', False, 'Turn on profiling mode (default: False)')
 
 """ Image
@@ -134,11 +135,8 @@ def train():
     for num_epoch in range(num_epochs):
         scheduler.step()
 
-        if FLAGS.mode == Mode.teacher_forcing:
+        if mode & Mode.use_teacher_forcing:
             teacher_forcing_ratio = max(0, 1 - (num_epoch // FLAGS.tf_decay_epochs) * FLAGS.tf_decay)
-
-        elif FLAGS.mode == Mode.self_critical:
-            teacher_forcing_ratio = 0.0
 
         for phase in phases:
             log = Log()
@@ -164,25 +162,25 @@ def train():
                 metrics = {}
 
                 if phase == Phase.train:
-                    if FLAGS.mode == Mode.debug_label:
-                        output = model(batch, phase=Phase.train)
+                    kwargs = {}
 
-                    if FLAGS.mode in [Mode.auto_regress, Mode.teacher_forcing]:
-                        output = model(batch, phase=Phase.train, teacher_forcing_ratio=teacher_forcing_ratio)
+                    if mode & Mode.use_teacher_forcing:
+                        kwargs.update({'teacher_forcing_ratio': teacher_forcing_ratio})
 
-                    if FLAGS.mode == Mode.self_critical:
-                        output = model(batch, phase=Phase.train, beam_size=1)
+                    if mode & Mode.use_self_critical:
+                        kwargs.update({'beam_size': 1})
+
+                    output = model(batch, phase=Phase.train, **kwargs)
 
                     ###
-
-                    if FLAGS.mode == Mode.debug_label:
+                    if mode & Mode.use_label_all_ce:
                         losses['label_ce'] = F.binary_cross_entropy(output['_label'], output['label'].sum(1).clamp(0, 1))
 
-                    if FLAGS.mode in [Mode.auto_regress, Mode.teacher_forcing]:
+                    if mode & Mode.use_label_ce:
                         losses['label_ce'] = F.binary_cross_entropy(output['_label'], output['label'])
                         losses['stop_bce'] = F.binary_cross_entropy(output['_stop'], output['stop'])
 
-                    if FLAGS.mode == Mode.teacher_forcing:
+                    if mode & Mode.use_teacher_forcing:
                         reports = train_dataset.convert_sentence(output['text'], output['sent_length'], output['text_length'])
                         _reports = train_dataset.convert_sentence(output['_text'], output['sent_length'], output['text_length'])
 
@@ -191,7 +189,7 @@ def train():
 
                         losses['word_ce'] = F.nll_loss(_log_probability, word)
 
-                    if FLAGS.mode == Mode.self_critical:
+                    if mode & Mode.use_self_critical:
                         output = model(batch, phase=Phase.train, beam_size=1)
 
                         reports = train_dataset.convert_sentence(output['text'], output['sent_length'], output['text_length'])
@@ -211,16 +209,21 @@ def train():
                         metrics['reward'] = reward.mean()
 
                 elif phase == Phase.val:
-                    with torch.no_grad():
-                        if FLAGS.mode in [Mode.debug_label, Mode.auto_regress]:
-                            output = model(batch, phase=Phase.val)
+                    kwargs = {}
 
-                        if FLAGS.mode in [Mode.teacher_forcing, Mode.self_critical]:
-                            output = model(batch, phase=Phase.val, beam_size=FLAGS.beam_size, alpha=FLAGS.alpha, beta=FLAGS.beta)
+                    if mode & Mode.gen_text:
+                        kwargs.update({
+                            'beam_size': FLAGS.beam_size,
+                            'alpha': FLAGS.alpha,
+                            'beta': FLAGS.beta,
+                        })
+
+                    with torch.no_grad():
+                        output = model(batch, phase=Phase.val, **kwargs)
 
                     ###
 
-                    if FLAGS.mode == Mode.debug_label:
+                    if mode & Mode.use_label_all_ce:
                         label_all = output['label'].sum(1).clamp(0, 1)
                         _label_all = output['_label']
 
@@ -231,7 +234,7 @@ def train():
                             '_label_all': _label_all,
                         })
 
-                    if FLAGS.mode in [Mode.auto_regress, Mode.teacher_forcing]:
+                    if mode & Mode.use_label_ce:
                         label = pad_packed_sequence(output['label'], length=output['text_length'])
                         _label = pad_packed_sequence(output['_label'], length=output['_text_length'])
 
@@ -248,7 +251,7 @@ def train():
                             '_label_all': _label_all,
                         })
 
-                    if FLAGS.mode in [Mode.teacher_forcing, Mode.self_critical]:
+                    if mode & Mode.gen_text:
                         reports = train_dataset.convert_sentence(output['text'], output['sent_length'], output['text_length'])
                         _reports = train_dataset.convert_sentence(output['_text'][:, 0], output['_sent_length'][:, 0], output['_text_length'])
 
@@ -280,7 +283,7 @@ def train():
                         writer.add_scalar(f'{phase}/teacher_forcing_ratio', teacher_forcing_ratio, global_step=num_step)
                         writer.add_log(_log, prefix=phase, global_step=num_step)
 
-                    if (num_step % FLAGS.log_text_steps == 0) and (FLAGS.mode in [Mode.teacher_forcing, Mode.self_critical]):
+                    if (num_step % FLAGS.log_text_steps == 0) and (mode & Mode.gen_text):
                         writer.add_texts(reports, 'text', prefix=phase, global_step=num_step)
                         writer.add_texts(_reports, '_text', prefix=phase, global_step=num_step)
 
@@ -292,7 +295,7 @@ def train():
                     torch.save(model.state_dict(), os.path.join(working_dir, f'model-epoch-{num_epoch}.pth'))
 
             elif phase == Phase.val:
-                if FLAGS.mode in [Mode.debug_label, Mode.auto_regress, Mode.teacher_forcing]:
+                if (mode & Mode.use_label_all_ce) or (mode & Mode.use_label_ce):
                     (label_all, _label_all) = [
                         torch.cat([log_item[key] for log_item in log_items], 0)
                         for key in ['label_all', '_label_all']
@@ -423,21 +426,24 @@ def test():
 if __name__ == '__main__':
     argv = FLAGS(sys.argv)
 
+    logging.basicConfig(level=logging.DEBUG if FLAGS.debug else logging.INFO)
+    logger = logging.getLogger(__name__)
+
+    warnings.filterwarnings('ignore')
+
+    version = version_of(FLAGS.ckpt_path)
     kwargs = FLAGS.flag_values_dict()
     kwargs.update({
         '__use_continuous_label': version_of(FLAGS.ckpt_path) > 1548152415,
         '__no_recurrent_label': version_of(FLAGS.ckpt_path) > 1548347568,
         '__image_encoder_relu': version_of(FLAGS.ckpt_path) > 1548428102,
         '__sample_text': version_of(FLAGS.ckpt_path) > 1548708003,
-        '__use_densenet': version_of(FLAGS.ckpt_path) > 1548881554,
+        '__use_densenet': version_of(FLAGS.ckpt_path, ascend=True) > 1548881554,
         '__no_temp': version_of(FLAGS.ckpt_path) > 1548881554,
     })
+    logger.info(json.dumps(kwargs, indent=4))
 
-    warnings.filterwarnings('ignore')
-
-    logging.basicConfig(level=logging.DEBUG if FLAGS.debug else logging.INFO)
-    logger = logging.getLogger(__name__)
-
+    mode = Mode[FLAGS.mode]
     device = torch.device(FLAGS.device)
     if FLAGS.debug:
         FLAGS.num_workers = 0

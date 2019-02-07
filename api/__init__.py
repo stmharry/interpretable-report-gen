@@ -1,12 +1,21 @@
-class Mode:
-    debug_label     = 'debug_label'
-    auto_regress    = 'auto_regress'
-    teacher_forcing = 'teacher_forcing'
-    self_critical   = 'self_critical'
+import enum
 
-    __all__ = [debug_label, auto_regress, teacher_forcing, self_critical]
-    label_modes = [auto_regress, teacher_forcing, self_critical]
-    text_modes = [teacher_forcing, self_critical]
+class Mode(enum.Flag):
+    gen_label_all       = enum.auto()
+    gen_label           = enum.auto()
+    gen_text            = enum.auto()
+
+    use_label_all_ce    = enum.auto()
+    use_label_ce        = enum.auto()
+    use_teacher_forcing = enum.auto()
+    use_self_critical   = enum.auto()
+
+    debug_label = gen_label_all | use_label_all_ce
+    pretrain    = gen_label | use_label_ce
+    debug_text  = gen_label | gen_text | use_teacher_forcing
+    full_tf     = gen_label | gen_text | use_label_ce | use_teacher_forcing
+    full_sc     = gen_label | gen_text | use_label_ce | use_self_critical
+
 
 class Phase:
     train = 'train'
