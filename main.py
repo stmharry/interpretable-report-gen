@@ -13,8 +13,11 @@ import functools
 import html
 import json
 import logging
+import matplotlib
+import matplotlib.pyplot as plot
 import os
 import pandas as pd
+import PIL.Image
 import sklearn.metrics
 import sys
 import torch
@@ -23,7 +26,7 @@ import tqdm
 import warnings
 
 from absl import flags
-from htmltag import HTML, html, head, body, link, div, img
+from htmltag import HTML, html, head, body, link, script, div, span, img, p
 from json2html import json2html
 from torch.nn import (
     functional as F,
@@ -62,7 +65,8 @@ flags.DEFINE_enum('mode', None, list(Mode.__members__.keys()), 'Training mode ('
 flags.DEFINE_string('device', 'cuda', 'GPU device to use (default: "cuda")')
 flags.DEFINE_bool('debug', False, 'Turn on debug mode (default: False)')
 flags.DEFINE_bool('debug_subsample', False, 'Turn on subsampling for debugging (default: False)')
-flags.DEFINE_bool('debug_one_sentence', False, 'Turn on one-sentence generating mode (default: False)')
+flags.DEFINE_string('debug_use_dataset', None, 'Turn on alternate dataset postfix (default: None)')
+flags.DEFINE_bool('debug_one_sentence', False, 'Turn on one sentence mode (default: False)')
 flags.DEFINE_bool('profile', False, 'Turn on profiling mode (default: False)')
 
 """ Image
@@ -173,11 +177,14 @@ def train():
                     output = model(batch, phase=Phase.train, **kwargs)
 
                     ###
+
                     if mode & Mode.use_label_all_ce:
                         losses['label_ce'] = F.binary_cross_entropy(output['_label'], output['label'].sum(1).clamp(0, 1))
 
                     if mode & Mode.use_label_ce:
                         losses['label_ce'] = F.binary_cross_entropy(output['_label'], output['label'])
+
+                    if mode & Mode.use_stop_bce:
                         losses['stop_bce'] = F.binary_cross_entropy(output['_stop'], output['stop'])
 
                     if mode & Mode.use_teacher_forcing:
@@ -335,6 +342,9 @@ def test():
 
     log = Log()
 
+    image_dir = os.path.join(working_dir, 'imgs')
+    os.makedirs(image_dir)
+
     prog = tqdm.tqdm(enumerate(data_loader), total=len(data_loader))
     for (num_batch, batch) in prog:
         for (key, value) in batch.items():
@@ -363,15 +373,17 @@ def test():
             _label,                # (num_reports, max_num_sentences, label_size)
             _stop,                 # (num_reports, max_num_sentences, 1)
             _temp,                 # (num_reports, max_num_sentences, 1)
+            _attention,            # (num_repoers, max_num_sentences, beam_size, max_num_words, 65)
             _score,                # (num_reports, max_num_sentences, beam_size)
             _sum_log_probability,  # (num_reports, max_num_sentences, beam_size)
             _text,                 # (num_reports, max_num_sentences, beam_size, max_num_words)
             _sent_length,          # (num_reports, max_num_sentences, beam_size)
         ) = [
             pad_packed_sequence(batch[key], length=_text_length)
-            for key in ['_label', '_stop', '_temp', '_score', '_sum_log_probability', '_text', '_sent_length']
+            for key in ['_label', '_stop', '_temp', '_attention', '_score', '_sum_log_probability', '_text', '_sent_length']
         ]
 
+        (fig, ax) = plot.subplots(1, figsize=(6, 6), gridspec_kw={'left': 0, 'right': 1, 'bottom': 0, 'top': 1})
         reports = []
         for num_report in range(len(_text_length)):
             item = dataset.df.iloc[int(item_index[num_report])]
@@ -383,24 +395,56 @@ def test():
                 for num_beam in range(FLAGS.beam_size):
                     num_words = _sent_length[num_report, num_sentence, num_beam]
                     _sentence = _text[num_report, num_sentence, num_beam]
+                    _words = train_dataset.index_to_word[to_numpy(_sentence[:num_words])]
 
-                    beam_text = ' '.join(train_dataset.index_to_word[to_numpy(_sentence[:num_words])])
+                    beam_texts = []
+                    for num_word in range(num_words):
+                        _attention_path = os.path.join(image_dir, f'{num_report}-{num_sentence}-{num_beam}-{num_word}.png')
+
+                        _a = _attention[num_report, num_sentence, num_beam, num_word, :FLAGS.image_size * FLAGS.image_size]
+                        _a_sum = _a.sum()
+                        _a = _a / _a.max()
+                        _a = _a.reshape(FLAGS.image_size, FLAGS.image_size)
+                        _a = F.interpolate(_a[None, None, :], scale_factor=(8, 8), mode='bilinear', align_corners=True)[0, 0]
+
+                        ax.contourf(to_numpy(_a), cmap='Reds')
+                        ax.set_axis_off()
+
+                        fig.savefig(_attention_path, bbox_inches=0)
+                        fig.clf()
+
+                        beam_texts.append(span(html.escape(_words[num_word]), **{
+                            'data-toggle': 'tooltip',
+                            'title': (
+                                p('Total attention: ' + to_str(_a_sum)) +
+                                img(src=f'http://monday.csail.mit.edu/xiuming{_attention_path}', width='128', height='128')
+                            ).replace('"', '\''),
+                        }))
 
                     beams.append({
                         'score': to_str(_score[num_report, num_sentence, num_beam]),
                         'log_prob': to_str(_sum_log_probability[num_report, num_sentence, num_beam]),
-                        'text': str(html.escape(beam_text)),
+                        'text': str('\n'.join(beam_texts)),
                     })
 
-                sentences.append({
-                    'stop': to_str(_stop[num_report, num_sentence]),
-                    'temp': to_str(_temp[num_report, num_sentence]),
-                    'labels': [{
-                        'label': label_col,
-                        'prob': to_str(_l),
-                    } for (label_col, _l) in zip(train_dataset.label_columns, _label[num_report, num_sentence])],
-                    'beams': beams,
-                })
+                sentence = {}
+
+                if mode & Mode.use_label_ce:
+                    sentence.update({
+                        'stop': to_str(_stop[num_report, num_sentence]),
+                        'temp': to_str(_temp[num_report, num_sentence]),
+                        'labels': [{
+                            'label': label_col,
+                            'prob': to_str(_l),
+                        } for (label_col, _l) in zip(train_dataset.label_columns, _label[num_report, num_sentence])],
+                    })
+
+                if mode & Mode.gen_text:
+                    sentence.update({
+                        'beams': beams,
+                    })
+
+                sentences.append(sentence)
 
             report = {
                 'image': str(img(src=f'http://monday.csail.mit.edu/xiuming{image_path}', width='256')),
@@ -411,14 +455,20 @@ def test():
 
             reports.append(report)
 
-        if num_batch == 4:
+        if num_batch == 1:
             break
 
     s = json2html.convert(json=reports, table_attributes='class="table table-striped"', escape=False)
-    s = head(link(rel='stylesheet', href='https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/css/bootstrap.min.css')) + \
+    s = (
+        head([
+            link(rel='stylesheet', href='https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/css/bootstrap.min.css'),
+            script(src='https://cdnjs.cloudflare.com/ajax/libs/jquery/3.3.1/jquery.min.js'),
+            script(src='https://maxcdn.bootstrapcdn.com/bootstrap/3.3.7/js/bootstrap.min.js'),
+            script('$(function () { $(\'[data-toggle="tooltip"]\').tooltip({placement: "bottom", html: true}); })', type="text/javascript"),
+        ]) +
         body(div(div(div(HTML(s), _class='panel-body'), _class='panel panel-default'), _class='container-fluid'))
+    )
 
-    os.makedirs(working_dir)
     with open(os.path.join(working_dir, 'index.html'), 'w') as f:
         f.write(s)
 
@@ -429,6 +479,7 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.DEBUG if FLAGS.debug else logging.INFO)
     logger = logging.getLogger(__name__)
 
+    matplotlib.use('Agg')
     warnings.filterwarnings('ignore')
 
     version = version_of(FLAGS.ckpt_path)

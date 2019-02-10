@@ -90,6 +90,7 @@ class Model(Module):
         if self.__use_densenet:
             self.image_encoder = DenseNet121(**kwargs)
             path = os.path.join(os.path.dirname(__file__), os.pardir, 'checkpoints', 'model.pkl')
+            logger.info(f'Loading model from {path}')
             self.image_encoder.load_state_dict(torch.load(path)['state_dict'])
         else:
             self.image_encoder = ResNet50(**kwargs)

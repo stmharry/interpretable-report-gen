@@ -37,8 +37,8 @@ class MimicCXRDataset(torch.utils.data.Dataset):
             )
 
     def _sentence_label_path(self):
-        debug_postfix = '.debug' if self.debug_one_sentence else ''
-        return os.path.join(os.getenv('CACHE_DIR'), f'sentence-label-field-{self.field}{debug_postfix}.tsv')
+        postfix = '' if self.debug_use_dataset is None else f'.{self.debug_use_dataset}'
+        return os.path.join(os.getenv('CACHE_DIR'), f'sentence-label-field-{self.field}{postfix}.tsv')
 
     def _make_sentence_label(self):
         def _tokenize_join(sentence):
@@ -111,6 +111,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         self.embedding_size = embedding_size
         self.phase = phase
 
+        self.debug_use_dataset  = kwargs['debug_use_dataset']
         self.debug_one_sentence = kwargs['debug_one_sentence']
         self.__use_densenet     = kwargs['__use_densenet']
 
@@ -126,9 +127,11 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         self.label_columns = [column for column in self.df_sentence_label.columns if column.startswith('label_')]
         self.label_size = len(self.label_columns)
 
+        if self.debug_use_dataset:
+            self.df = self.df[self.df.rad_id.isin(self.df_sentence_label.index.unique())]
+
         if self.debug_one_sentence:
             self.max_report_length = 1
-            self.df = self.df[self.df.rad_id.isin(self.df_sentence_label.index.unique())]
 
         if phase is None and (not os.path.isfile(self._cider_cache_path())):
             self._make_cider_cache()
