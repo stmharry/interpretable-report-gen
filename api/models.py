@@ -80,7 +80,7 @@ class Model(Module):
     def __init__(self, **kwargs):
         super(Model, self).__init__()
 
-        self.mode           = kwargs['mode']
+        self.mode           = Mode[kwargs['mode']]
         self.embedding_size = kwargs['embedding_size']
         self.label_size     = kwargs['label_size']
         self.dropout        = kwargs['dropout']
@@ -90,18 +90,19 @@ class Model(Module):
         if self.__use_densenet:
             self.image_encoder = DenseNet121(**kwargs)
             path = os.path.join(os.path.dirname(__file__), os.pardir, 'checkpoints', 'model.pkl')
+            logger.info(f'Loading model from {path}')
             self.image_encoder.load_state_dict(torch.load(path)['state_dict'])
         else:
             self.image_encoder = ResNet50(**kwargs)
 
-        if self.mode == Mode.debug_label:
+        if self.mode & Mode.gen_label_all:
             self.fc_label = Linear(self.embedding_size, self.label_size)
             self.drop = Dropout(self.dropout)
 
-        elif self.mode in Mode.label_modes:
+        if self.mode & Mode.gen_label:
             self.report_decoder = ReportDecoder(**kwargs)
 
-        if self.mode in Mode.text_modes:
+        if self.mode & Mode.gen_text:
             self.sentence_decoder = SentenceDecoder(**kwargs)
 
     @profile
@@ -116,17 +117,16 @@ class Model(Module):
 
         output.update(self.image_encoder(output))
 
-        if self.mode == Mode.debug_label:
+        if self.mode & Mode.gen_label_all:
             output['_label'] = torch.sigmoid(self.fc_label(self.drop(output['image'].mean(1))))
 
-        if self.mode in Mode.label_modes:
-            if (phase == Phase.train) and (self.mode in [Mode.auto_regress, Mode.teacher_forcing]):
-                output.update(self.report_decoder._train(output, length=output['text_length'], **kwargs))
-                _text_length = output['text_length']
-
-            elif (phase == Phase.train) and (self.mode == Mode.self_critical) or (phase in [Phase.val, Phase.test]):
+        if self.mode & Mode.gen_label:
+            if (phase == Phase.train) and (self.mode & Mode.use_self_critical) or (phase in [Phase.val, Phase.test]):
                 output.update(self.report_decoder._test(output, **kwargs))
                 _text_length = output['_text_length']
+            else:
+                output.update(self.report_decoder._train(output, length=output['text_length'], **kwargs))
+                _text_length = output['text_length']
 
             for key in ['image', 'view_position']:
                 output[key] = expand_to_sequence(output[key], length=torch.max(_text_length))
@@ -138,10 +138,10 @@ class Model(Module):
                 for key in ['text', 'label', 'stop', 'sent_length']:
                     output[key] = pack_padded_sequence(output[key], length=output['text_length'])
 
-            if (phase == Phase.train) and (self.mode == Mode.teacher_forcing):
+            if (phase == Phase.train) and (self.mode & Mode.use_teacher_forcing):
                 output.update(self.sentence_decoder._train(output, length=output['sent_length'], **kwargs))
 
-            elif (phase == Phase.train) and (self.mode == Mode.self_critical):
+            elif (phase == Phase.train) and (self.mode & Mode.use_self_critical):
                 output.update(self.sentence_decoder._test(output, probabilistic=True, **kwargs))
 
             elif phase in [Phase.val, Phase.test]:
