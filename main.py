@@ -41,21 +41,11 @@ from api import Mode, Phase
 from api.datasets import MimicCXRDataset
 from api.data_loader import CollateFn
 from api.models import Model
-from api.utils import (
-    SummaryWriter,
-    to_numpy,
-    pack_padded_sequence,
-    pad_packed_sequence,
-    pad_sequence,
-    print_batch,
-    version_of,
-    profile,
-)
-from api.metrics import (
-    Bleu,
-    Rouge,
-    CiderD as Cider,
-)
+from api.metrics import Bleu, Rouge, CiderD as Cider
+from api.utils import to_numpy, profile
+from api.utils.io import version_of, load_state_dict
+from api.utils.log import print_batch, SummaryWriter
+from api.utils.rnn import pack_padded_sequence, pad_packed_sequence, pad_sequence
 
 """ Global
 """
@@ -148,9 +138,11 @@ def train():
 
             if phase == Phase.train:
                 data_loader = train_loader
+                torch.set_grad_enabled(True)
 
             elif phase == Phase.val:
                 data_loader = val_loader
+                torch.set_grad_enabled(False)
 
             prog = tqdm.tqdm(enumerate(data_loader), total=len(data_loader))
             for (num_batch, batch) in prog:
@@ -175,8 +167,6 @@ def train():
                         kwargs.update({'beam_size': 1})
 
                     output = model(batch, phase=Phase.train, **kwargs)
-
-                    ###
 
                     if mode & Mode.use_label_all_ce:
                         losses['label_ce'] = F.binary_cross_entropy(output['_label'], output['label'].sum(1).clamp(0, 1))
@@ -225,10 +215,7 @@ def train():
                             'beta': FLAGS.beta,
                         })
 
-                    with torch.no_grad():
-                        output = model(batch, phase=Phase.val, **kwargs)
-
-                    ###
+                    output = model(batch, phase=Phase.val, **kwargs)
 
                     if mode & Mode.use_label_all_ce:
                         label_all = output['label'].sum(1).clamp(0, 1)
@@ -563,12 +550,18 @@ if __name__ == '__main__':
         'label_size': train_dataset.label_size,
     })
 
-    model = DataParallel(Model(**kwargs)).to(device)
+    model = Model(**kwargs)
+    if kwargs['__use_densenet']:
+        path = os.path.join(os.path.dirname(__file__), 'checkpoints', 'model.pkl')
+        logger.info(f'Loading model from {path}')
+        load_state_dict(model.image_encoder, torch.load(path)['state_dict'])
+
+    model = DataParallel(model).to(device)
     logger.info(f'Model info:\n{model}')
 
     if FLAGS.ckpt_path:
         logger.info(f'Loading model from {FLAGS.ckpt_path}')
-        model.load_state_dict(torch.load(FLAGS.ckpt_path), strict=False)
+        load_state_dict(model, torch.load(FLAGS.ckpt_path))
 
     if FLAGS.debug:
         working_dir = os.path.join(FLAGS.working_dir, 'debug')

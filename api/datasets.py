@@ -14,7 +14,8 @@ from torchvision.transforms import Lambda, Resize, Compose, ColorJitter, ToTenso
 
 from api import Phase, Token
 from api.metrics import CiderScorer
-from api.utils import to_numpy, pack_padded_sequence, pad_packed_sequence
+from api.utils import to_numpy
+from api.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 
 class MimicCXRDataset(torch.utils.data.Dataset):

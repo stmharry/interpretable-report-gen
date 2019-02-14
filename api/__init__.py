@@ -10,6 +10,7 @@ class Mode(enum.Flag):
     use_stop_bce        = enum.auto()
     use_teacher_forcing = enum.auto()
     use_self_critical   = enum.auto()
+    use_chexpert        = enum.auto()
 
     debug_label = gen_label_all | use_label_all_ce
     pretrain    = gen_label | use_label_ce | use_stop_bce

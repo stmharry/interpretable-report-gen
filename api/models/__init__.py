@@ -3,33 +3,16 @@ import logging
 import os
 import re
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
-from torch.nn import (
-    Module as _Module,
-    LSTMCell,
-    AdaptiveAvgPool2d,
-    Conv2d,
-    Embedding,
-    Linear,
-    ReLU,
-    Dropout,
-)
-from torchvision.models.resnet import (
-    ResNet,
-    Bottleneck,
-)
-from torchvision.models.densenet import DenseNet
+from torchvision.models.resnet import ResNet, Bottleneck
+# from torchvision.models.densenet import DenseNet
 
 from api import Mode, Phase, Token
-from api.utils import (
-    expand_to_sequence,
-    pack_padded_sequence,
-    pad_packed_sequence,
-    pad_sequence,
-    print_batch,
-    profile,
-)
+from api.models.densenet import DenseNet
+from api.utils import profile
+from api.utils.rnn import expand_to_sequence, pack_padded_sequence, pad_packed_sequence, pad_sequence
 
 logger = logging.getLogger(__name__)
 
@@ -66,7 +49,7 @@ class Categorical(object):
         return self.logits.gather(1, x.unsqueeze(1)).squeeze(1)
 
 
-class Module(_Module):
+class Module(nn.Module):
     def forward(self, batch, phase=None, **kwargs):
         if phase == Phase.train:
             return self._train(batch, **kwargs)
@@ -89,15 +72,12 @@ class Model(Module):
 
         if self.__use_densenet:
             self.image_encoder = DenseNet121(**kwargs)
-            path = os.path.join(os.path.dirname(__file__), os.pardir, 'checkpoints', 'model.pkl')
-            logger.info(f'Loading model from {path}')
-            self.image_encoder.load_state_dict(torch.load(path)['state_dict'])
         else:
             self.image_encoder = ResNet50(**kwargs)
 
         if self.mode & Mode.gen_label_all:
-            self.fc_label = Linear(self.embedding_size, self.label_size)
-            self.drop = Dropout(self.dropout)
+            self.fc_label = nn.Linear(self.embedding_size, self.label_size)
+            self.drop = nn.Dropout(self.dropout)
 
         if self.mode & Mode.gen_label:
             self.report_decoder = ReportDecoder(**kwargs)
@@ -162,10 +142,10 @@ class ResNet50(ResNet):
 
         self.__image_encoder_relu = kwargs['__image_encoder_relu']
 
-        self.conv1 = Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-        self.avgpool = AdaptiveAvgPool2d((self.image_size, self.image_size))
-        self.fc = Conv2d(self.image_embedding_size, self.embedding_size, (1, 1))
-        self.drop = Dropout(self.dropout)
+        self.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.avgpool = nn.AdaptiveAvgPool2d((self.image_size, self.image_size))
+        self.fc = nn.Conv2d(self.image_embedding_size, self.embedding_size, (1, 1))
+        self.drop = nn.Dropout(self.dropout)
 
     @profile
     def forward(self, batch):
@@ -213,10 +193,10 @@ class DenseNet121(DenseNet):
         self.embedding_size = kwargs['embedding_size']
         self.dropout        = kwargs['dropout']
 
-        self.avgpool = AdaptiveAvgPool2d((self.image_size, self.image_size))
-        self.fc = Conv2d(self.image_embedding_size, self.embedding_size, (1, 1))
-        self.drop = Dropout(self.dropout)
-        self.relu = ReLU(inplace=True)
+        self.avgpool = nn.AdaptiveAvgPool2d((self.image_size, self.image_size))
+        self.fc = nn.Conv2d(self.image_embedding_size, self.embedding_size, (1, 1))
+        self.drop = nn.Dropout(self.dropout)
+        self.relu = nn.ReLU(inplace=True)
 
     def load_state_dict(self, state_dict, strict=False):
         pattern = re.compile(r'^(.*denselayer\d+\.(?:norm|relu|conv))\.((?:[12])\.(?:weight|bias|running_mean|running_var))$')
@@ -260,8 +240,8 @@ class ReportDecoder(Module):
         self.__use_continuous_label = kwargs['__use_continuous_label']
         self.__no_recurrent_label   = kwargs['__no_recurrent_label']
 
-        self.fc_h = Linear(self.embedding_size, self.hidden_size)
-        self.fc_m = Linear(self.embedding_size, self.hidden_size)
+        self.fc_h = nn.Linear(self.embedding_size, self.hidden_size)
+        self.fc_m = nn.Linear(self.embedding_size, self.hidden_size)
 
         self.lstm_sizes = (
             [self.embedding_size] +                                     # image
@@ -269,18 +249,18 @@ class ReportDecoder(Module):
             [1] +                                                       # begin
             ([] if self.__no_recurrent_label else [self.label_size])    # label
         )
-        self.lstm_cell = LSTMCell(sum(self.lstm_sizes), self.hidden_size)
+        self.lstm_cell = nn.LSTMCell(sum(self.lstm_sizes), self.hidden_size)
         self.fc_sizes = (
             ([] if self.__no_recurrent_label else [self.label_size]) +  # label
             [self.hidden_size] +                                        # topic
             [1] +                                                       # stop
             [1]                                                         # temp
         )
-        self.fc = Linear(self.hidden_size, sum(self.fc_sizes))
+        self.fc = nn.Linear(self.hidden_size, sum(self.fc_sizes))
         if self.__no_recurrent_label:
-            self.fc_label = Linear(self.hidden_size, self.label_size)
+            self.fc_label = nn.Linear(self.hidden_size, self.label_size)
 
-        self.drop = Dropout(self.dropout)
+        self.drop = nn.Dropout(self.dropout)
 
     @profile
     def _step(self, batch):
@@ -495,10 +475,10 @@ class SentenceDecoder(Module):
 
         self.vocab_size = len(self.word_to_index)
 
-        self.word_embedding = Embedding.from_pretrained(torch.from_numpy(self.word_embedding), freeze=False)
-        self.fc_v = Linear(self.embedding_size, self.hidden_size)
-        self.fc_h = Linear(self.embedding_size, self.hidden_size)
-        self.fc_m = Linear(self.embedding_size, self.hidden_size)
+        self.word_embedding = nn.Embedding.from_pretrained(torch.from_numpy(self.word_embedding), freeze=False)
+        self.fc_v = nn.Linear(self.embedding_size, self.hidden_size)
+        self.fc_h = nn.Linear(self.embedding_size, self.hidden_size)
+        self.fc_m = nn.Linear(self.embedding_size, self.hidden_size)
         self.lstm_sizes = (
             [self.embedding_size] +                                     # image
             [2 * self.view_position_size] +                             # view_position
@@ -506,17 +486,17 @@ class SentenceDecoder(Module):
             [self.hidden_size] +                                        # topic
             [self.embedding_size]                                       # text
         )
-        self.lstm_cell = LSTMCell(sum(self.lstm_sizes), self.hidden_size)
+        self.lstm_cell = nn.LSTMCell(sum(self.lstm_sizes), self.hidden_size)
         self.fc_sizes = [
             self.embedding_size,  # hidden
             self.embedding_size,  # sentinel
         ]
-        self.fc = Linear(self.hidden_size, sum(self.fc_sizes))
-        self.fc_hh = Linear(self.embedding_size, self.hidden_size)
-        self.fc_s = Linear(self.embedding_size, self.hidden_size)
-        self.fc_z = Linear(self.hidden_size, 1)
-        self.fc_p = Linear(self.embedding_size, self.vocab_size)
-        self.drop = Dropout(self.dropout)
+        self.fc = nn.Linear(self.hidden_size, sum(self.fc_sizes))
+        self.fc_hh = nn.Linear(self.embedding_size, self.hidden_size)
+        self.fc_s = nn.Linear(self.embedding_size, self.hidden_size)
+        self.fc_z = nn.Linear(self.hidden_size, 1)
+        self.fc_p = nn.Linear(self.embedding_size, self.vocab_size)
+        self.drop = nn.Dropout(self.dropout)
 
     @profile
     def _step(self, batch):
