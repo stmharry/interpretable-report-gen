@@ -121,7 +121,9 @@ class MimicCXRDataset(torch.utils.data.Dataset):
 
         self.view_position_size = max(self.view_position_to_index.values()) + 1
 
-        if phase is None and (not os.path.isfile(self._sentence_label_path())):
+        # df_sentence_label
+
+        if (phase is None) and (not os.path.isfile(self._sentence_label_path())):
             self._make_sentence_label()
 
         self.df_sentence_label = pd.read_csv(self._sentence_label_path(), sep='\t', dtype={'rad_id': str}).set_index('rad_id')
@@ -134,10 +136,15 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         if self.debug_one_sentence:
             self.max_report_length = 1
 
-        if phase is None and (not os.path.isfile(self._cider_cache_path())):
+        # df_cache
+
+        if (phase is None) and (not os.path.isfile(self._cider_cache_path())):
             self._make_cider_cache()
 
-        self.df_cache = torch.load(self._cider_cache_path())
+        if phase == Phase.train:
+            self.df_cache = torch.load(self._cider_cache_path())
+
+        # word_embedding
 
         if (phase == Phase.train) and (not os.path.isfile(self._word_embedding_path())):
             self._make_word_embedding()
@@ -149,6 +156,8 @@ class MimicCXRDataset(torch.utils.data.Dataset):
             word_vectors.vectors,
             np.zeros((1, embedding_size)),
         ], axis=0).astype(np.float32)
+
+        # transform
 
         if phase == Phase.train:
             jitter = [ColorJitter(brightness=0.5, contrast=0.5)]
@@ -240,4 +249,4 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         word = self.index_to_word[to_numpy(word)]
         words = np.split(word, np.cumsum(to_numpy(length)))[:-1]
 
-        return [' '.join(word) for word in words]
+        return np.array([' '.join(word) for word in words])

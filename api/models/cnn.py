@@ -2,8 +2,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as cp
+import re
 
 from collections import OrderedDict
+from torchvision.models.resnet import ResNet, Bottleneck
+
+from api.utils import profile
 
 
 class _DenseLayer(nn.Module):
@@ -121,3 +125,99 @@ class DenseNet(nn.Module):
                 nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.Linear):
                 nn.init.constant_(m.bias, 0)
+
+
+class DenseNet121(DenseNet):
+    image_embedding_size = 1024
+
+    def __init__(self, **kwargs):
+        super(DenseNet121, self).__init__(num_init_features=64, growth_rate=32, block_config=(6, 12, 24, 16))
+
+        self.image_size     = kwargs['image_size']
+        self.embedding_size = kwargs['embedding_size']
+        self.dropout        = kwargs['dropout']
+
+        self.avgpool = nn.AdaptiveAvgPool2d((self.image_size, self.image_size))
+        self.fc = nn.Conv2d(self.image_embedding_size, self.embedding_size, (1, 1))
+        self.drop = nn.Dropout(self.dropout)
+        self.relu = nn.ReLU(inplace=True)
+
+    def load_state_dict(self, state_dict, strict=False):
+        pattern = re.compile(r'^(.*denselayer\d+\.(?:norm|relu|conv))\.((?:[12])\.(?:weight|bias|running_mean|running_var))$')
+
+        _state_dict = {}
+        for key in state_dict.keys():
+            match = pattern.match(key)
+            _key = (match.group(1) + match.group(2)) if match else key
+
+            _state_dict[_key[19:]] = state_dict[key]  # module.densenet121.*
+
+        super(DenseNet121, self).load_state_dict(_state_dict, strict=strict)
+
+    @profile
+    def forward(self, batch):
+        image = batch['image']
+
+        image = self.features(image)
+        image = self.relu(image)
+
+        image = self.avgpool(image)
+        image = self.drop(image)
+        image = self.fc(image)
+        image = self.relu(image)
+        image = image.view(-1, self.embedding_size, self.image_size * self.image_size).transpose(1, 2)
+
+        return {'image': image}
+
+
+class ResNet50(ResNet):
+    image_embedding_size = 2048
+
+    def __init__(self, **kwargs):
+        super(ResNet50, self).__init__(Bottleneck, [3, 4, 6, 3])
+
+        self.image_size     = kwargs['image_size']
+        self.embedding_size = kwargs['embedding_size']
+        self.dropout        = kwargs['dropout']
+
+        self.__image_encoder_relu = kwargs['__image_encoder_relu']
+
+        self.conv1 = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
+        self.avgpool = nn.AdaptiveAvgPool2d((self.image_size, self.image_size))
+        self.fc = nn.Conv2d(self.image_embedding_size, self.embedding_size, (1, 1))
+        self.drop = nn.Dropout(self.dropout)
+
+    @profile
+    def forward(self, batch):
+        """
+
+        Args:
+            image (batch_size, 1, 256, 256): Grayscale Image.
+
+        Returns:
+            image (batch_size, image_size * image_size, image_embedding_size): Image feature map.
+
+        """
+
+        image = batch['image']
+
+        image = self.conv1(image)
+        image = self.bn1(image)
+        image = self.relu(image)
+        image = self.maxpool(image)
+
+        image = self.layer1(image)
+        image = self.layer2(image)
+        image = self.layer3(image)
+        image = self.layer4(image)
+
+        image = self.avgpool(image)
+        image = self.drop(image)
+        image = self.fc(image)
+
+        if self.__image_encoder_relu:
+            image = self.relu(image)
+
+        image = image.view(-1, self.embedding_size, self.image_size * self.image_size).transpose(1, 2)
+
+        return {'image': image}

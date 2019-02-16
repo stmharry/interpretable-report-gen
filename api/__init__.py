@@ -16,7 +16,7 @@ class Mode(enum.Flag):
     pretrain    = gen_label | use_label_ce | use_stop_bce
     debug_text  = gen_label | gen_text | use_stop_bce | use_teacher_forcing
     full_tf     = gen_label | gen_text | use_label_ce | use_stop_bce | use_teacher_forcing
-    full_sc     = gen_label | gen_text | use_label_ce | use_stop_bce | use_self_critical
+    full_sc     = gen_label | gen_text | use_self_critical
 
 
 class Phase:

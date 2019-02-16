@@ -40,8 +40,8 @@ from mimic_cxr.utils import Log
 from api import Mode, Phase
 from api.datasets import MimicCXRDataset
 from api.data_loader import CollateFn
-from api.models import Model
-from api.metrics import Bleu, Rouge, CiderD as Cider
+from api.models import Model, DataParallelCPU
+from api.metrics import Bleu, Rouge, CiderD as Cider, CheXpert
 from api.utils import to_numpy, profile
 from api.utils.io import version_of, load_state_dict
 from api.utils.log import print_batch, SummaryWriter
@@ -100,8 +100,10 @@ def train():
     optimizer = torch.optim.Adam(model.parameters(), lr=FLAGS.lr)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, FLAGS.lr_decay_epochs, FLAGS.lr_decay)
 
-    scorers = [Bleu(4), Rouge(), Cider(df_cache=dataset.df_cache)]
-    cider = scorers[2]
+    bleu = Bleu(4)
+    rouge = Rouge()
+    cider = Cider(df_cache=train_dataset.df_cache)
+    chexpert = DataParallelCPU(CheXpert(), num_processes=32)
 
     if FLAGS.do == 'train':
         os.makedirs(working_dir)
@@ -252,11 +254,13 @@ def train():
                         for scorer in scorers:
                             metric = scorer(_reports, reports)
 
+                            '''
                             if metric.dim() == 2:
                                 for (num, _metric) in enumerate(metric):
                                     metrics[f'{scorer.method()}-{num + 1}'] = _metric.mean().item()
                             else:
                                 metrics[f'{scorer.method()}'] = metric.mean().item()
+                            '''
 
                 if phase == Phase.train:
                     total_loss = sum(losses.values())
@@ -273,8 +277,9 @@ def train():
 
                 if phase == Phase.train:
                     if num_step % FLAGS.log_steps == 0:
+                        if mode & Mode.use_teacher_forcing:
+                            writer.add_scalar(f'{phase}/teacher_forcing_ratio', teacher_forcing_ratio, global_step=num_step)
                         writer.add_scalar(f'{phase}/learning_rate', optimizer.param_groups[0]['lr'], global_step=num_step)
-                        writer.add_scalar(f'{phase}/teacher_forcing_ratio', teacher_forcing_ratio, global_step=num_step)
                         writer.add_log(_log, prefix=phase, global_step=num_step)
 
                     if (num_step % FLAGS.log_text_steps == 0) and (mode & Mode.gen_text):

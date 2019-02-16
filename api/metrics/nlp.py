@@ -1,22 +1,12 @@
 import numpy as np
-import torch
 
 from pyciderevalcap3.ciderD.ciderD import CiderD as _CiderD
 from pyciderevalcap3.ciderD.ciderD_scorer import CiderScorer as _CiderScorer
 from pycocoevalcap3.bleu.bleu import Bleu as _Bleu
 from pycocoevalcap3.bleu.bleu_scorer import BleuScorer
 from pycocoevalcap3.rouge.rouge import Rouge as _Rouge
-from pycocoevalcap3.spice.spice import Spice as _Spice
 
-
-class MetricMixin:
-    def __call__(self, input_, target):
-        (_, scores) = self.compute_score(
-            {num: [_target] for (num, _target) in enumerate(target)},
-            {num: [_input] for (num, _input) in enumerate(input_)},
-        )
-
-        return torch.as_tensor(scores, dtype=torch.float).cuda()
+from api.metrics.base import MetricMixin
 
 
 class CiderScorer(_CiderScorer):
@@ -53,8 +43,4 @@ class Bleu(_Bleu, MetricMixin):
 
 
 class Rouge(_Rouge, MetricMixin):
-    pass
-
-
-class Spice(_Spice, MetricMixin):
     pass
