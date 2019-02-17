@@ -6,7 +6,7 @@ from negbio.neg import semgraph, propagator, neg_detector
 from negbio import ngrex
 from tqdm import tqdm
 
-from constants import *
+from chexpert.constants import *
 
 
 class ModifiedDetector(neg_detector.Detector):
@@ -80,7 +80,7 @@ class Classifier(object):
                  post_negation_uncertainty_path, verbose=False):
         self.parser = parse.NegBioParser(model_dir=PARSING_MODEL_DIR)
         self.lemmatizer = ptb2ud.Lemmatizer()
-        self.ptb2dep = ptb2ud.NegBioPtb2DepConverter(self.lemmatizer, universal=True)
+        self.ptb2dep = ptb2ud.NegBioPtb2DepConverter(universal=True)
 
         self.verbose = verbose
 

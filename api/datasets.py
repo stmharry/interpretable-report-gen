@@ -13,7 +13,7 @@ from nltk.tokenize.casual import TweetTokenizer
 from torchvision.transforms import Lambda, Resize, Compose, ColorJitter, ToTensor, Normalize
 
 from api import Phase, Token
-from api.metrics import CiderScorer
+from api.metrics.nlp import CiderScorer
 from api.utils import to_numpy
 from api.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
@@ -25,6 +25,11 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         'LL': 3,
         'LATERAL': 3,
     }
+    view_position_size = max(view_position_to_index.values()) + 1
+
+    df_sentence_label = None
+    df_cache = None
+    index_to_word = None
 
     def __iter__(self):
         yield from self._iterate_sentences()
@@ -86,7 +91,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
 
     def _make_cider_cache(self):
         cider_scorer = CiderScorer()
-        for sentence in tqdm.tqdm(self.df_sentence_label['sentence']):
+        for sentence in tqdm.tqdm(MimicCXRDataset.df_sentence_label['sentence']):
             cider_scorer += (None, [sentence])
         cider_scorer.compute_doc_freq()
         torch.save({
@@ -119,43 +124,37 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         self.sent_tokenizer = PunktSentenceTokenizer()
         self.word_tokenizer = TweetTokenizer()
 
-        self.view_position_size = max(self.view_position_to_index.values()) + 1
-
-        # df_sentence_label
-
         if (phase is None) and (not os.path.isfile(self._sentence_label_path())):
             self._make_sentence_label()
 
-        self.df_sentence_label = pd.read_csv(self._sentence_label_path(), sep='\t', dtype={'rad_id': str}).set_index('rad_id')
-        self.label_columns = [column for column in self.df_sentence_label.columns if column.startswith('label_')]
-        self.label_size = len(self.label_columns)
+        if MimicCXRDataset.df_sentence_label is None:
+            MimicCXRDataset.df_sentence_label = pd.read_csv(self._sentence_label_path(), sep='\t', dtype={'rad_id': str}).set_index('rad_id')
+            MimicCXRDataset.label_columns = [column for column in self.df_sentence_label.columns if column.startswith('label_')]
+            MimicCXRDataset.label_size = len(self.label_columns)
 
         if self.debug_use_dataset:
-            self.df = self.df[self.df.rad_id.isin(self.df_sentence_label.index.unique())]
+            self.df = self.df[self.df.rad_id.isin(MimicCXRDataset.df_sentence_label.index.unique())]
 
         if self.debug_one_sentence:
             self.max_report_length = 1
 
-        # df_cache
-
         if (phase is None) and (not os.path.isfile(self._cider_cache_path())):
             self._make_cider_cache()
 
-        if phase == Phase.train:
-            self.df_cache = torch.load(self._cider_cache_path())
-
-        # word_embedding
+        if MimicCXRDataset.df_cache is None:
+            MimicCXRDataset.df_cache = torch.load(self._cider_cache_path())
 
         if (phase == Phase.train) and (not os.path.isfile(self._word_embedding_path())):
             self._make_word_embedding()
 
-        word_vectors = KeyedVectors.load(self._word_embedding_path())
-        self.index_to_word = np.array(word_vectors.index2entity + [Token.unk])
-        self.word_to_index = dict(zip(self.index_to_word, range(len(self.index_to_word))))
-        self.word_embedding = np.concatenate([
-            word_vectors.vectors,
-            np.zeros((1, embedding_size)),
-        ], axis=0).astype(np.float32)
+        if MimicCXRDataset.index_to_word is None:
+            word_vectors = KeyedVectors.load(self._word_embedding_path())
+            MimicCXRDataset.index_to_word = np.array(word_vectors.index2entity + [Token.unk])
+            MimicCXRDataset.word_to_index = dict(zip(self.index_to_word, range(len(self.index_to_word))))
+            MimicCXRDataset.word_embedding = np.concatenate([
+                word_vectors.vectors,
+                np.zeros((1, embedding_size)),
+            ], axis=0).astype(np.float32)
 
         # transform
 
@@ -190,12 +189,12 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         image = PIL.Image.open(path)
         image = self.transform(image)
 
-        view_position_index = self.view_position_to_index.get(item.view_position, 0)
-        view_position_indices = [self.view_position_to_index.get(view_position, 0) for view_position in df_rad.view_position]
+        view_position_index = MimicCXRDataset.view_position_to_index.get(item.view_position, 0)
+        view_position_indices = [MimicCXRDataset.view_position_to_index.get(view_position, 0) for view_position in df_rad.view_position]
 
         view_position = torch.cat([
-            torch.arange(self.view_position_size) == view_position_index,
-            (torch.arange(self.view_position_size).unsqueeze(1) == torch.as_tensor(view_position_indices)).any(1),
+            torch.arange(MimicCXRDataset.view_position_size) == view_position_index,
+            (torch.arange(MimicCXRDataset.view_position_size).unsqueeze(1) == torch.as_tensor(view_position_indices)).any(1),
         ], 0)
         view_position = torch.as_tensor(view_position, dtype=torch.float)
 
@@ -209,14 +208,14 @@ class MimicCXRDataset(torch.utils.data.Dataset):
             text = []
             sent_length = []
 
-            df_sentence = self.df_sentence_label.loc[[item.rad_id]]
+            df_sentence = MimicCXRDataset.df_sentence_label.loc[[item.rad_id]]
             for item_sentence in df_sentence.itertuples():
                 words = item_sentence.sentence.split()
 
                 num_words = min(len(words), self.max_sentence_length - 1) + 1
                 words = torch.as_tensor((
-                    [self.word_to_index.get(word, self.word_to_index[Token.unk]) for word in words[:num_words - 1]] +
-                    [self.word_to_index[Token.eos]] +
+                    [MimicCXRDataset.word_to_index.get(word, MimicCXRDataset.word_to_index[Token.unk]) for word in words[:num_words - 1]] +
+                    [MimicCXRDataset.word_to_index[Token.eos]] +
                     [0] * (self.max_sentence_length - num_words)
                 ), dtype=torch.long)
 
@@ -227,7 +226,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
             sent_length = torch.as_tensor(sent_length, dtype=torch.long)
             text_length = torch.as_tensor(sent_length.numel(), dtype=torch.long)
 
-            label = torch.as_tensor(df_sentence[self.label_columns].values, dtype=torch.float)
+            label = torch.as_tensor(df_sentence[MimicCXRDataset.label_columns].values, dtype=torch.float)
 
             num = torch.arange(text_length, dtype=torch.long).unsqueeze(1)
             stop = torch.as_tensor(num == text_length - 1, dtype=torch.float)
@@ -241,12 +240,3 @@ class MimicCXRDataset(torch.utils.data.Dataset):
             })
 
         return _item
-
-    def convert_sentence(self, sent, sent_length, text_length):
-        word = pack_padded_sequence(sent, length=sent_length)
-        length = pad_packed_sequence(sent_length, length=text_length).sum(1)
-
-        word = self.index_to_word[to_numpy(word)]
-        words = np.split(word, np.cumsum(to_numpy(length)))[:-1]
-
-        return np.array([' '.join(word) for word in words])

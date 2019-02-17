@@ -4,7 +4,7 @@ import bioc
 import pandas as pd
 from negbio.pipeline import text2bioc, ssplit, section_split
 
-from constants import *
+from chexpert.constants import *
 
 
 class Loader(object):
@@ -30,7 +30,7 @@ class Loader(object):
             if self.extract_impression:
                 document = section_split.split_document(document)
                 self.extract_impression_from_passages(document)
-            
+
             split_document = self.splitter.split_doc(document)
 
             assert len(split_document.passages) == 1,\

@@ -8,8 +8,8 @@ class MetricMixin:
             {num: [_input] for (num, _input) in enumerate(input_)},
         )
 
-        metric =  torch.as_tensor(scores, dtype=torch.float).cuda()
-        if metric.dim == 1:
+        metric = torch.as_tensor(scores, dtype=torch.float).cuda()
+        if metric.dim() == 1:
             metric = metric.unsqueeze(0)
 
         return metric.t()
