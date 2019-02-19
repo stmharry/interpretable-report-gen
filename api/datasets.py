@@ -51,7 +51,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
     def _make_report_chexpert(self):
         df = self.df.drop_duplicates('rad_id')[['rad_id', 'text']]
 
-        chexpert = DataParallelCPU(CheXpert, num_jobs=None, verbose=True)
+        chexpert = DataParallelCPU(CheXpert, verbose=True)
         chexpert_label = chexpert(df.text.values)
 
         _df = pd.DataFrame({'rad_id': df.rad_id})

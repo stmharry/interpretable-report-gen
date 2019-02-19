@@ -6,7 +6,7 @@ from api import Mode, Phase
 from api.models.base import DataParallelCPU, ExponentialMovingAverage
 from api.models.cnn import DenseNet121, ResNet50
 from api.models.rnn import ReportDecoder, SentenceDecoder
-from api.models.nondiff import SentIndex2Report, CheXpert
+from api.models.nondiff import SentIndex2Report, CheXpert, CheXpertAggregator
 from api.utils import profile
 from api.utils.rnn import expand_to_sequence, pack_padded_sequence
 

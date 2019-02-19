@@ -69,7 +69,7 @@ class DataParallelCPU(DeviceMixin):
     as your system can be easily crippled by queueing a lot of CPU tensors.
     """
 
-    def __init__(self, model_cls, num_jobs, maxtasksperchild=256, verbose=False):
+    def __init__(self, model_cls, num_jobs=None, maxtasksperchild=256, verbose=False):
         super(DataParallelCPU, self).__init__()
 
         self.model_cls = model_cls
@@ -108,11 +108,9 @@ class DataParallelCPU(DeviceMixin):
 
     def __call__(self, *args):
         args = self.scatter(args)
-        objs = self.pool.imap(_pool_func, ((self.model_cls,) + _args for _args in args))
-        if self.verbose:
-            objs = tqdm.tqdm(objs, total=len(args))
-        objs = list(objs)
+        objs = self.pool.map_async(_pool_func, [(self.model_cls,) + _args for _args in args]).get()
         objs = self.gather(objs).to(self.device)
+
         return objs
 
 

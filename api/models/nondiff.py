@@ -4,6 +4,7 @@ import psutil
 import os
 import re
 import torch
+import torch.nn as nn
 
 import chexpert
 
@@ -70,7 +71,8 @@ class CheXpert(DeviceMixin):
         if not isinstance(s, np.ndarray):
             s = np.array([s], dtype=object)
 
-        s = '"' + s + '"'
+        # stmharry: extra space to ensure the string is not empty
+        s = '"' + s + ' "'
         s = '\n'.join(s)
         s = self.clean(s)
 
@@ -88,3 +90,24 @@ class CheXpert(DeviceMixin):
         return labels
 
     __call__ = forward
+
+
+class CheXpertAggregator(nn.Module):
+    def __init__(self):
+        super(CheXpertAggregator, self).__init__()
+
+        self._importance_lookup = nn.Parameter(torch.as_tensor([0, 2, 1, 3]), requires_grad=False)
+        self._inv_importance_lookup = self._importance_lookup
+
+    def forward(self, chexpert_label_sent, text_length):
+        chexpert_label_sents = chexpert_label_sent.split(text_length.tolist(), 0)
+
+        chexpert_labels = []
+        for chexpert_label_sent in chexpert_label_sents:
+            chexpert_label = self._importance_lookup[chexpert_label_sent].max(0)[0]
+            chexpert_label[0] = 3 * chexpert_label[1:13].max().lt(2).long()
+            chexpert_label = self._inv_importance_lookup[chexpert_label]
+
+            chexpert_labels.append(chexpert_label)
+
+        return torch.stack(chexpert_labels, 0)
