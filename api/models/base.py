@@ -5,10 +5,21 @@ import os
 import torch
 import torch.multiprocessing as multiprocessing
 import torch.nn as nn
+import tqdm
 
 from api import Phase
 
 logger = logging.getLogger(__name__)
+multiprocessing.set_sharing_strategy('file_system')
+
+
+class DeviceMixin:
+    def __init__(self):
+        self.device = None
+
+    def to(self, device):
+        self.device = device
+        return self
 
 
 class Module(nn.Module):
@@ -20,6 +31,7 @@ class Module(nn.Module):
         elif phase == Phase.test:
             return self._test(batch, **kwargs)
 
+
 """ Helper function for `multiprocessing'
 
 Has to be here to be pickle-able. Simply *sad*. And guess what? GLOBAL!
@@ -27,28 +39,51 @@ Has to be here to be pickle-able. Simply *sad*. And guess what? GLOBAL!
 
 _model_dict = {}
 
+
 def _pool_initializer(model_cls):
     logger.debug(f'[{os.getpid()}] DataParallelCPU.initializer')
+
     global _model_dict
     _model_dict[model_cls.__name__] = model_cls()
 
 
-def _pool_func(model_cls, *args, **kwargs):
+def _pool_func(args):
+    model_cls = args[0]
+    args = args[1:]
+
     logger.debug(f'[{os.getpid()}] DataParallelCPU.func(model_cls={model_cls}, args={args})')
+
     global _model_dict
-    return _model_dict[model_cls.__name__](*args, **kwargs)
+    return _model_dict[model_cls.__name__](*args)
 
 
-class DataParallelCPU(object):
+class DataParallelCPU(DeviceMixin):
     """ Mock interface for parallelism on CPU.
 
     Unfortunately this requires `global' keyword to work as current `multiprocessing'
     is not quite class-friendly.
+
+    ### IMPORTANT NOTE ###
+    If you have modules returning tensors on CPUs, check out
+        `https://pytorch.org/docs/stable/multiprocessing.html#sharing-strategies',
+    as your system can be easily crippled by queueing a lot of CPU tensors.
     """
 
-    def __init__(self, model_cls, num_jobs):
+    def __init__(self, model_cls, num_jobs, maxtasksperchild=256, verbose=False):
+        super(DataParallelCPU, self).__init__()
+
         self.model_cls = model_cls
-        self.pool = multiprocessing.Pool(num_jobs, initializer=_pool_initializer, initargs=(model_cls,))
+        self.verbose = verbose
+
+        num_jobs = num_jobs or multiprocessing.cpu_count()
+        self.pool = multiprocessing.Pool(
+            num_jobs,
+            initializer=_pool_initializer,
+            initargs=(model_cls,),
+            maxtasksperchild=maxtasksperchild,
+        )
+
+        logger.info(f'DataParallelCPU using {num_jobs} processes')
 
     def scatter(self, obj):
         if isinstance(obj, np.ndarray):
@@ -67,12 +102,31 @@ class DataParallelCPU(object):
         if isinstance(obj, torch.Tensor):
             return torch.cat(objs)
         if isinstance(obj, (tuple, list)):
-            return type(out)(map(self.gather, zip(*objs)))
+            return type(obj)(map(self.gather, zip(*objs)))
         if isinstance(obj, dict):
-            return type(out)([(key, self.gather(map(operator.itemgetter(key), objs))) for key in obj.keys()])
+            return type(obj)([(key, self.gather(map(operator.itemgetter(key), objs))) for key in obj.keys()])
 
     def __call__(self, *args):
         args = self.scatter(args)
-        objs = self.pool.starmap(_pool_func, [(self.model_cls,) + _args for _args in args])
-        objs = self.gather(objs)
+        objs = self.pool.imap(_pool_func, ((self.model_cls,) + _args for _args in args))
+        if self.verbose:
+            objs = tqdm.tqdm(objs, total=len(args))
+        objs = list(objs)
+        objs = self.gather(objs).to(self.device)
         return objs
+
+
+class ExponentialMovingAverage(nn.Module):
+    def __init__(self, beta=0.95):
+        super(ExponentialMovingAverage, self).__init__()
+
+        self.beta = beta
+        self.average = None
+
+    def __call__(self, x):
+        if self.average is None:
+            self.average = x
+        else:
+            self.average = self.beta * self.average + (1 - self.beta) * x
+
+        return self.average

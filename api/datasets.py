@@ -12,10 +12,11 @@ from nltk.tokenize.casual import TweetTokenizer
 
 from torchvision.transforms import Lambda, Resize, Compose, ColorJitter, ToTensor, Normalize
 
+from chexpert import CATEGORIES
+
 from api import Phase, Token
+from api.models import DataParallelCPU, CheXpert
 from api.metrics.nlp import CiderScorer
-from api.utils import to_numpy
-from api.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 
 class MimicCXRDataset(torch.utils.data.Dataset):
@@ -28,6 +29,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
     view_position_size = max(view_position_to_index.values()) + 1
 
     df_sentence_label = None
+    df_chexpert_label = None
     df_cache = None
     index_to_word = None
 
@@ -41,6 +43,22 @@ class MimicCXRDataset(torch.utils.data.Dataset):
                 self.df_sentence_label['sentence'].split()
                 [Token.eos]
             )
+
+    def _report_chexpert_path(self):
+        postfix = '' if self.debug_use_dataset is None else f'.{self.debug_use_dataset}'
+        return os.path.join(os.getenv('CACHE_DIR'), f'report-chexpert-field-{self.field}{postfix}.tsv')
+
+    def _make_report_chexpert(self):
+        df = self.df.drop_duplicates('rad_id')[['rad_id', 'text']]
+
+        chexpert = DataParallelCPU(CheXpert, num_jobs=None, verbose=True)
+        chexpert_label = chexpert(df.text.values)
+
+        _df = pd.DataFrame({'rad_id': df.rad_id})
+        for (num, category) in enumerate(CATEGORIES):
+            _df[category] = chexpert_label[:, num]
+
+        _df.to_csv(self._report_chexpert_path(), sep='\t', index=False)
 
     def _sentence_label_path(self):
         postfix = '' if self.debug_use_dataset is None else f'.{self.debug_use_dataset}'
@@ -123,6 +141,12 @@ class MimicCXRDataset(torch.utils.data.Dataset):
 
         self.sent_tokenizer = PunktSentenceTokenizer()
         self.word_tokenizer = TweetTokenizer()
+
+        if (phase is None) and (not os.path.isfile(self._report_chexpert_path())):
+            self._make_report_chexpert()
+
+        if MimicCXRDataset.df_chexpert_label is None:
+            MimicCXRDataset.df_chexpert_label = pd.read_csv(self._report_chexpert_path(), sep='\t', dtype={'rad_id': str}).set_index('rad_id')
 
         if (phase is None) and (not os.path.isfile(self._sentence_label_path())):
             self._make_sentence_label()
@@ -208,8 +232,8 @@ class MimicCXRDataset(torch.utils.data.Dataset):
             text = []
             sent_length = []
 
-            df_sentence = MimicCXRDataset.df_sentence_label.loc[[item.rad_id]]
-            for item_sentence in df_sentence.itertuples():
+            df_sentence_label = MimicCXRDataset.df_sentence_label.loc[[item.rad_id]]
+            for item_sentence in df_sentence_label.itertuples():
                 words = item_sentence.sentence.split()
 
                 num_words = min(len(words), self.max_sentence_length - 1) + 1
@@ -226,7 +250,11 @@ class MimicCXRDataset(torch.utils.data.Dataset):
             sent_length = torch.as_tensor(sent_length, dtype=torch.long)
             text_length = torch.as_tensor(sent_length.numel(), dtype=torch.long)
 
-            label = torch.as_tensor(df_sentence[MimicCXRDataset.label_columns].values, dtype=torch.float)
+            # TODO(stmharry): remove label as it is not providing any benefit
+            label = torch.as_tensor(df_sentence_label[MimicCXRDataset.label_columns].values, dtype=torch.float)
+
+            df_chexpert_label = MimicCXRDataset.df_chexpert_label.loc[item.rad_id]
+            chexpert_label = torch.as_tensor(df_chexpert_label[CATEGORIES].values, dtype=torch.long)
 
             num = torch.arange(text_length, dtype=torch.long).unsqueeze(1)
             stop = torch.as_tensor(num == text_length - 1, dtype=torch.float)
@@ -235,6 +263,7 @@ class MimicCXRDataset(torch.utils.data.Dataset):
                 'text_length': text_length,
                 'text': text,
                 'label': label,
+                'chexpert_label': chexpert_label,
                 'stop': stop,
                 'sent_length': sent_length,
             })

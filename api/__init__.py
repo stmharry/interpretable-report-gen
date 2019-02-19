@@ -21,8 +21,8 @@ class Mode(enum.Flag):
 
 class Phase:
     train = 'train'
-    val = 'val'
-    test = 'test'
+    val   = 'val'
+    test  = 'test'
 
 
 class Token:

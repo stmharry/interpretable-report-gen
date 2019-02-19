@@ -17,7 +17,6 @@ import matplotlib
 import matplotlib.pyplot as plot
 import os
 import pandas as pd
-import PIL.Image
 import sklearn.metrics
 import sys
 import torch
@@ -26,12 +25,11 @@ import tqdm
 import warnings
 
 from absl import flags
-from htmltag import HTML, html, head, body, link, script, div, span, img, p
+from htmltag import HTML, head, body, link, script, div, span, img, p
 from json2html import json2html
 from torch.nn import (
     functional as F,
     DataParallel,
-    Embedding,
 )
 
 from mimic_cxr.data import MIMIC_CXR
@@ -40,12 +38,12 @@ from mimic_cxr.utils import Log
 from api import Mode, Phase
 from api.datasets import MimicCXRDataset
 from api.data_loader import CollateFn
-from api.models import Model, DataParallelCPU, SentIndex2Report, CheXpert
-from api.metrics import Bleu, Rouge, CiderD as Cider
+from api.models import Model, DataParallelCPU, SentIndex2Report, CheXpert, ExponentialMovingAverage
+from api.metrics import Bleu, Rouge, CiderD as Cider, MentionSim
 from api.utils import to_numpy, profile
 from api.utils.io import version_of, load_state_dict
 from api.utils.log import print_batch, SummaryWriter
-from api.utils.rnn import pack_padded_sequence, pad_packed_sequence, pad_sequence
+from api.utils.rnn import pack_padded_sequence, pad_packed_sequence
 
 """ Global
 """
@@ -179,7 +177,7 @@ def train():
         logger.info(f'Loading model from {path}')
         load_state_dict(model.image_encoder, torch.load(path)['state_dict'])
 
-    model = DataParallel(model).to(device)
+    model = DataParallel(model).to(FLAGS.device)
     logger.info(f'Model info:\n{model}')
 
     if FLAGS.ckpt_path:
@@ -197,11 +195,12 @@ def train():
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, FLAGS.lr_decay_epochs, FLAGS.lr_decay)
 
     converter = SentIndex2Report(index_to_word=MimicCXRDataset.index_to_word)
-    bleu = Bleu(4)
-    rouge = Rouge()
-    cider = Cider(df_cache=MimicCXRDataset.df_cache)
-    # chexpert = DataParallelCPU(CheXpert, num_jobs=4)
-    chexpert = CheXpert()
+    chexpert = DataParallelCPU(CheXpert).to(FLAGS.device)
+    bleu = Bleu(4).to(FLAGS.device)
+    rouge = Rouge().to(FLAGS.device)
+    cider = Cider(df_cache=MimicCXRDataset.df_cache).to(FLAGS.device)
+    mention_sim = MentionSim(alpha=0.5).to(FLAGS.device)
+    ema = ExponentialMovingAverage(beta=0.95).to(FLAGS.device)
 
     if FLAGS.do == 'train':
         os.makedirs(working_dir)
@@ -252,7 +251,7 @@ def train():
                     optimizer.zero_grad()
 
                 for (key, value) in batch.items():
-                    batch[key] = value.to(device)
+                    batch[key] = value.to(FLAGS.device)
 
                 losses = {}
                 metrics = {}
@@ -297,15 +296,26 @@ def train():
                             output_greedy = model(batch, phase=Phase.test, beam_size=1)
                         _report_greedy = converter(output_greedy['_text'][:, 0], output_greedy['_sent_length'][:, 0], output_greedy['_text_length'])
 
-                        metric = cider(_report, report)
-                        metric_greedy = cider(_report_greedy, report)
-                        reward = metric - metric_greedy
+                        report_cider = cider(_report, report)
+                        report_cider_greedy = cider(_report_greedy, report)
 
-                        losses['report_sc'] = - (_sum_log_probability * reward).mean()
-                        metrics['cider'] = metric.mean()
+                        metrics['cider'] = report_cider.mean()
+
+                        _chexpert_label = chexpert(_report)
+                        sim = mention_sim(_chexpert_label, output['chexpert_label'])
+                        sim_baseline = ema(sim).mean()
+
+                        metrics['sim'] = sim.mean()
+
+                        reward_report = report_cider - report_cider_greedy
+                        reward_sim = sim - sim_baseline
+                        reward = reward_report + reward_sim
+
+                        losses['REINFORCE'] = - (_sum_log_probability * reward).mean()
+
+                        metrics['reward_report'] = reward_report.mean()
+                        metrics['reward_sim'] = reward_sim.mean()
                         metrics['reward'] = reward.mean()
-
-                        import pdb; pdb.set_trace()
 
                 elif phase == Phase.val:
                     kwargs = {}
@@ -351,18 +361,19 @@ def train():
                         report = converter(output['text'], output['sent_length'], output['text_length'])
                         _report = converter(output['_text'][:, 0], output['_sent_length'][:, 0], output['_text_length'])
 
-                        # TODO
+                        for scorer in [bleu, rouge, cider]:
+                            report_score = scorer(_report, report)
 
-                        '''
-                        for scorer in scorers:
-                            metric = scorer(_report, report)
-
-                            if metric.dim() == 2:
-                                for (num, _metric) in enumerate(metric):
-                                    metrics[f'{scorer.method()}-{num + 1}'] = _metric.mean().item()
+                            if report_score.dim() == 2:
+                                for (num, _report_score) in enumerate(report_score):
+                                    metrics[f'{scorer.method()}-{num + 1}'] = _report_score.mean()
                             else:
-                                metrics[f'{scorer.method()}'] = metric.mean().item()
-                        '''
+                                metrics[f'{scorer.method()}'] = report_score.mean()
+
+                        _chexpert_label = chexpert(_report)
+                        sim = mention_sim(_chexpert_label, output['chexpert_label'])
+
+                        metrics['sim'] = sim.mean()
 
                 if phase == Phase.train:
                     total_loss = sum(losses.values())
@@ -443,7 +454,7 @@ def test():
     prog = tqdm.tqdm(enumerate(data_loader), total=len(data_loader))
     for (num_batch, batch) in prog:
         for (key, value) in batch.items():
-            batch[key] = value.to(device)
+            batch[key] = value.to(FLAGS.device)
 
         losses = {}
         metrics = {}
@@ -578,7 +589,6 @@ if __name__ == '__main__':
     warnings.filterwarnings('ignore')
 
     mode = Mode[FLAGS.mode]
-    device = torch.device(FLAGS.device)
     if FLAGS.debug:
         FLAGS.num_workers = 0
 

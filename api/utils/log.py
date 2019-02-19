@@ -11,9 +11,14 @@ class SummaryWriter(tensorboardX.SummaryWriter):
 
     def add_texts(self, texts, name, prefix, global_step=None):
         log_text = '\n'.join(
-            ['| num | text |'] +
-            ['|:---:|:-----|'] +
-            ['|{}|{}|'.format(num_text, text) for (num_text, text) in enumerate(texts)]
+            [
+                '| num | text |',
+                '|:---:|:-----|',
+            ]
+            + [
+                '|{}|{}|'.format(num_text, text)
+                for (num_text, text) in enumerate(texts)
+            ]
         )
         self.add_text(f'{prefix}/{name}', log_text, global_step=global_step)
 

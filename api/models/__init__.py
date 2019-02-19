@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 
 from api import Mode, Phase
-from api.models.base import Module, DataParallelCPU
+from api.models.base import DataParallelCPU, ExponentialMovingAverage
 from api.models.cnn import DenseNet121, ResNet50
 from api.models.rnn import ReportDecoder, SentenceDecoder
 from api.models.nondiff import SentIndex2Report, CheXpert
@@ -13,7 +13,7 @@ from api.utils.rnn import expand_to_sequence, pack_padded_sequence
 logger = logging.getLogger(__name__)
 
 
-class Model(Module):
+class Model(nn.Module):
     def __init__(self, **kwargs):
         super(Model, self).__init__()
 

@@ -15,6 +15,9 @@ class CollateFn(object):
                 return torch.stack(batch, 0)
 
         elif isinstance(batch[0], collections.Mapping):
-            return {key: self([d[key] for d in batch], is_sequence=(key in self.sequence_fields)) for key in batch[0]}
+            return {
+                key: self([d[key] for d in batch], is_sequence=(key in self.sequence_fields))
+                for key in batch[0]
+            }
 
         return torch.utils.data.dataloader.default_collate(batch)
