@@ -38,7 +38,9 @@ from mimic_cxr.utils import Log
 from api import Mode, Phase
 from api.datasets import MimicCXRDataset
 from api.data_loader import CollateFn
-from api.models import Model, DataParallelCPU, SentIndex2Report, CheXpert, CheXpertAggregator, ExponentialMovingAverage
+from api.models import Model
+from api.models.base import ExponentialMovingAverage
+from api.models.nondiff import SentIndex2Report, CheXpertAggregator, CheXpertRemote
 from api.metrics import Bleu, Rouge, CiderD as Cider, MentionSim
 from api.utils import to_numpy, profile
 from api.utils.io import version_of, load_state_dict
@@ -122,9 +124,9 @@ def train():
     test_df = df[df.subject_id.isin(mimic_cxr.test_subject_ids)]
 
     if FLAGS.debug_subsample:
-        train_df = train_df.sample(n=128)
-        val_df = val_df.sample(n=128)
-        test_df = test_df.sample(n=128)
+        train_df = train_df.sample(n=100)
+        val_df = val_df.sample(n=100)
+        test_df = test_df.sample(n=100)
 
     version = version_of(FLAGS.ckpt_path)
     kwargs = FLAGS.flag_values_dict()
@@ -196,8 +198,15 @@ def train():
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, FLAGS.lr_decay_epochs, FLAGS.lr_decay)
 
     converter = SentIndex2Report(index_to_word=MimicCXRDataset.index_to_word)
-    chexpert = DataParallelCPU(CheXpert).to(FLAGS.device)
-    chexpert_aggregator = CheXpertAggregator().to(FLAGS.device)
+    chexpert = CheXpertRemote(urls=[
+        'http://gray.csail.mit.edu:9478',
+        'http://harrison.csail.mit.edu:9478',
+        'http://visiongpu04.csail.mit.edu:9478',
+        'http://visiongpu05.csail.mit.edu:9478',
+        'http://visiongpu12.csail.mit.edu:9478',
+        'http://visiongpu14.csail.mit.edu:9478',
+    ]).to(FLAGS.device)
+    # chexpert_aggregator = CheXpertAggregator().to(FLAGS.device)
     bleu = Bleu(4).to(FLAGS.device)
     rouge = Rouge().to(FLAGS.device)
     cider = Cider(df_cache=MimicCXRDataset.df_cache).to(FLAGS.device)
@@ -290,7 +299,7 @@ def train():
                     if mode & Mode.use_self_critical:
                         report = converter(output['text'], output['sent_length'], output['text_length'])
                         _report = converter(output['_text'][:, 0], output['_sent_length'][:, 0], output['_text_length'])
-                        _report_sent = converter(output['_text'][:, 0], output['_sent_length'][:, 0], torch.ones_like(output['_sent_length'][:, 0]))
+                        # _report_sent = converter(output['_text'][:, 0], output['_sent_length'][:, 0], torch.ones_like(output['_sent_length'][:, 0]))
                         _sum_log_probability = pad_packed_sequence(output['_sum_log_probability'][:, 0], length=output['_text_length']).sum(1)
 
                         with torch.no_grad():
@@ -302,10 +311,11 @@ def train():
 
                         metrics['cider'] = report_cider.mean()
 
-                        _chexpert_label_sent = chexpert(_report_sent)
-                        _chexpert_label = chexpert_aggregator(_chexpert_label_sent, output['_text_length'])
+                        # _chexpert_label_sent = chexpert(_report_sent)
+                        # _chexpert_label = chexpert_aggregator(_chexpert_label_sent, output['_text_length'])
+                        _chexpert_label = chexpert(_report)
                         sim = mention_sim(_chexpert_label, output['chexpert_label'])
-                        sim_baseline = ema(sim).mean()
+                        sim_baseline = ema(sim.mean())
 
                         metrics['sim'] = sim.mean()
 
@@ -362,7 +372,6 @@ def train():
                     if mode & Mode.gen_text:
                         report = converter(output['text'], output['sent_length'], output['text_length'])
                         _report = converter(output['_text'][:, 0], output['_sent_length'][:, 0], output['_text_length'])
-                        _report_sent = converter(output['_text'][:, 0], output['_sent_length'][:, 0], torch.ones_like(output['_sent_length'][:, 0]))
 
                         for scorer in [bleu, rouge, cider]:
                             report_score = scorer(_report, report)
@@ -373,8 +382,7 @@ def train():
                             else:
                                 metrics[f'{scorer.method()}'] = report_score.mean()
 
-                        _chexpert_label_sent = chexpert(_report_sent)
-                        _chexpert_label = chexpert_aggregator(_chexpert_label_sent, output['_text_length'])
+                        _chexpert_label = chexpert(_report)
                         sim = mention_sim(_chexpert_label, output['chexpert_label'])
 
                         metrics['sim'] = sim.mean()

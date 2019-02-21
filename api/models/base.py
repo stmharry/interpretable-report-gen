@@ -48,13 +48,14 @@ def _pool_initializer(model_cls):
 
 
 def _pool_func(args):
-    model_cls = args[0]
-    args = args[1:]
+    num = args[0]
+    model_cls = args[1]
+    args = args[2:]
 
-    logger.debug(f'[{os.getpid()}] DataParallelCPU.func(model_cls={model_cls}, args={args})')
+    logger.debug(f'[{os.getpid()}] DataParallelCPU.func(num={num}, model_cls={model_cls}, args={args})')
 
     global _model_dict
-    return _model_dict[model_cls.__name__](*args)
+    return (num, _model_dict[model_cls.__name__](*args))
 
 
 class DataParallelCPU(DeviceMixin):
@@ -108,7 +109,15 @@ class DataParallelCPU(DeviceMixin):
 
     def __call__(self, *args):
         args = self.scatter(args)
-        objs = self.pool.map_async(_pool_func, [(self.model_cls,) + _args for _args in args]).get()
+        if self.verbose:
+            args = tqdm.tqdm(total=len(args))
+
+        objs = self.pool.imap_unordered(_pool_func, (
+            (num, self.model_cls,) + _args
+            for (num, _args) in enumerate(args)
+        ))
+        objs = dict(objs)
+        objs = [objs[num] for num in range(len(objs))]
         objs = self.gather(objs).to(self.device)
 
         return objs

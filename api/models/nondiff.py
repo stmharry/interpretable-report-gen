@@ -3,6 +3,7 @@ import numpy as np
 import psutil
 import os
 import re
+import grequests
 import torch
 import torch.nn as nn
 
@@ -111,3 +112,25 @@ class CheXpertAggregator(nn.Module):
             chexpert_labels.append(chexpert_label)
 
         return torch.stack(chexpert_labels, 0)
+
+
+class CheXpertRemote(DeviceMixin):
+    def __init__(self, urls, timeout=4.0):
+        super(CheXpertRemote).__init__()
+
+        self.urls = urls
+        self.timeout = timeout
+
+    def forward(self, s):
+        if not isinstance(s, np.ndarray):
+            s = np.array([s], dtype=object)
+
+        s_list = np.array_split(s, len(self.urls))
+        rs = [grequests.post(url, json=s.tolist()) for (url, s) in zip(self.urls, s_list)]
+        rs = grequests.map(rs)
+
+        objs = sum([r.json() for r in rs], [])
+        labels = torch.as_tensor(objs, dtype=torch.long, device=self.device)
+        return labels
+
+    __call__ = forward
