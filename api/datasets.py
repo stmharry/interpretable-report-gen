@@ -14,8 +14,9 @@ from torchvision.transforms import Lambda, Resize, Compose, ColorJitter, ToTenso
 
 from chexpert import CATEGORIES
 
-from api import Phase, Token
-from api.models import DataParallelCPU, CheXpert
+from api import Mode, Phase, Token
+from api.models.base import DataParallelCPU
+from api.models.nondiff import CheXpert
 from api.metrics.nlp import CiderScorer
 
 
@@ -135,6 +136,10 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         self.embedding_size = embedding_size
         self.phase = phase
 
+        self.mode        = Mode[kwargs['mode']]
+        self.image_size  = kwargs['image_size']
+        self.hidden_size = kwargs['hidden_size']
+
         self.debug_use_dataset  = kwargs['debug_use_dataset']
         self.debug_one_sentence = kwargs['debug_one_sentence']
         self.__use_densenet     = kwargs['__use_densenet']
@@ -209,32 +214,48 @@ class MimicCXRDataset(torch.utils.data.Dataset):
         item = self.df.iloc[index]
         df_rad = self.df.loc[self.df.rad_id == item.rad_id]
 
-        path = os.path.join(os.getenv('CACHE_DIR'), 'images', f'{item.dicom_id}.png')
-        image = PIL.Image.open(path)
-        image = self.transform(image)
-
-        view_position_index = MimicCXRDataset.view_position_to_index.get(item.view_position, 0)
-        view_position_indices = [MimicCXRDataset.view_position_to_index.get(view_position, 0) for view_position in df_rad.view_position]
-
-        view_position = torch.cat([
-            torch.arange(MimicCXRDataset.view_position_size) == view_position_index,
-            (torch.arange(MimicCXRDataset.view_position_size).unsqueeze(1) == torch.as_tensor(view_position_indices)).any(1),
-        ], 0)
-        view_position = torch.as_tensor(view_position, dtype=torch.float)
-
         _item = {
             'item_index': index,
-            'image': image,
-            'view_position': view_position,
         }
+
+        if self.mode & Mode.enc_image:
+            path = os.path.join(os.getenv('CACHE_DIR'), 'images', f'{item.dicom_id}.png')
+            image = PIL.Image.open(path)
+            image = self.transform(image)
+            _item.update({
+            })
+
+            view_position_index = MimicCXRDataset.view_position_to_index.get(item.view_position, 0)
+            view_position_indices = [MimicCXRDataset.view_position_to_index.get(view_position, 0) for view_position in df_rad.view_position]
+
+            view_position = torch.cat([
+                torch.arange(MimicCXRDataset.view_position_size) == view_position_index,
+                (torch.arange(MimicCXRDataset.view_position_size).unsqueeze(1) == torch.as_tensor(view_position_indices)).any(1),
+            ], 0)
+            view_position = torch.as_tensor(view_position, dtype=torch.float)
+
+            _item.update({
+                'image': image,
+                'view_position': view_position,
+            })
+        else:
+            _item.update({
+                'image': torch.randn((self.image_size * self.image_size, self.hidden_size), dtype=torch.float),
+                'view_position': torch.randint(0, 2, (2 * MimicCXRDataset.view_position_size,), dtype=torch.float),
+            })
 
         if (self.phase == Phase.train) or (self.phase == Phase.val):
             text = []
             sent_length = []
 
             df_sentence_label = MimicCXRDataset.df_sentence_label.loc[[item.rad_id]]
-            for item_sentence in df_sentence_label.itertuples():
-                words = item_sentence.sentence.split()
+            if self.mode & Mode.as_one_sentence:
+                sentences = [' '.join(df_sentence_label.sentence)]
+            else:
+                sentences = df_sentence_label.sentence
+
+            for sentence in sentences:
+                words = sentence.split()
 
                 num_words = min(len(words), self.max_sentence_length - 1) + 1
                 words = torch.as_tensor((

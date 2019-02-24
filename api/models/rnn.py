@@ -3,7 +3,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from api import Token
+from api import Mode, Token
 from api.models.base import Module
 from api.models.distribution import Categorical
 from api.utils import profile
@@ -258,6 +258,7 @@ class SentenceDecoder(Module):
     def __init__(self, **kwargs):
         super(SentenceDecoder, self).__init__()
 
+        self.mode                = Mode[kwargs['mode']]
         self.image_size          = kwargs['image_size']
         self.view_position_size  = kwargs['view_position_size']
         self.word_embedding      = kwargs['word_embedding']
@@ -288,15 +289,19 @@ class SentenceDecoder(Module):
             [self.embedding_size]                                       # text
         )
         self.lstm_cell = nn.LSTMCell(sum(self.lstm_sizes), self.hidden_size)
-        self.fc_sizes = [
-            self.embedding_size,  # hidden
-            self.embedding_size,  # sentinel
-        ]
-        self.fc = nn.Linear(self.hidden_size, sum(self.fc_sizes))
-        self.fc_hh = nn.Linear(self.embedding_size, self.hidden_size)
-        self.fc_s = nn.Linear(self.embedding_size, self.hidden_size)
-        self.fc_z = nn.Linear(self.hidden_size, 1)
-        self.fc_p = nn.Linear(self.embedding_size, self.vocab_size)
+        if self.mode & Mode.enc_with_attention:
+            self.fc_sizes = [
+                self.embedding_size,  # hidden
+                self.embedding_size,  # sentinel
+            ]
+            self.fc = nn.Linear(self.hidden_size, sum(self.fc_sizes))
+            self.fc_hh = nn.Linear(self.embedding_size, self.hidden_size)
+            self.fc_s = nn.Linear(self.embedding_size, self.hidden_size)
+            self.fc_z = nn.Linear(self.hidden_size, 1)
+            self.fc_p = nn.Linear(self.embedding_size, self.vocab_size)
+        else:
+            self.fc_p = nn.Linear(self.hidden_size, self.vocab_size)
+
         self.drop = nn.Dropout(self.dropout)
 
     @profile
@@ -309,19 +314,24 @@ class SentenceDecoder(Module):
             [self.drop(batch['topic'])] +
             [self.drop(text_embedding)]
         ), 1)
-
         (h, m) = self.lstm_cell(x, (batch['h'], batch['m']))
-        (hh, s) = F.relu(self.fc(self.drop(h))).unsqueeze(1).split(self.fc_sizes, 2)
-        _hh = self.fc_hh(self.drop(hh))
-        _s = self.fc_s(self.drop(s))
 
-        z = torch.tanh(torch.cat([batch['v'], _s], 1) + _hh)
-        z = self.fc_z(self.drop(z))
-        a = F.softmax(z, 1)
-        c = torch.sum(a * torch.cat([batch['image'], s], 1), 1)
+        if self.mode & Mode.enc_with_attention:
+            (hh, s) = F.relu(self.fc(self.drop(h))).unsqueeze(1).split(self.fc_sizes, 2)
+            _hh = self.fc_hh(self.drop(hh))
+            _s = self.fc_s(self.drop(s))
 
-        _attention = a.squeeze(2)
-        _logit = self.fc_p(self.drop(c + hh.squeeze(1)))
+            z = torch.tanh(torch.cat([batch['v'], _s], 1) + _hh)
+            z = self.fc_z(self.drop(z))
+            a = F.softmax(z, 1)
+            c = torch.sum(a * torch.cat([batch['image'], s], 1), 1)
+
+            _attention = a.squeeze(2)
+            _logit = self.fc_p(self.drop(c + hh.squeeze(1)))
+        else:
+            _attention = torch.zeros((len(h), self.image_size * self.image_size + 1), dtype=torch.float).cuda()  # useless
+            _logit = self.fc_p(self.drop(h))
+
         if not self.__no_temp:
             _logit = _logit / batch['temp']
         _log_probability = F.log_softmax(_logit, 1)

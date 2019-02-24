@@ -1,16 +1,18 @@
 import logging
+import multiprocessing
 import numpy as np
 import operator
 import os
 import torch
-import torch.multiprocessing as multiprocessing
+import torch.multiprocessing as mp
 import torch.nn as nn
 import tqdm
 
 from api import Phase
+from api.utils import to_numpy
 
 logger = logging.getLogger(__name__)
-multiprocessing.set_sharing_strategy('file_system')
+mp.set_sharing_strategy('file_system')
 
 
 class DeviceMixin:
@@ -55,7 +57,8 @@ def _pool_func(args):
     logger.debug(f'[{os.getpid()}] DataParallelCPU.func(num={num}, model_cls={model_cls}, args={args})')
 
     global _model_dict
-    return (num, _model_dict[model_cls.__name__](*args))
+    obj = _model_dict[model_cls.__name__](*args)
+    return (num, obj.tolist())
 
 
 class DataParallelCPU(DeviceMixin):
@@ -63,21 +66,18 @@ class DataParallelCPU(DeviceMixin):
 
     Unfortunately this requires `global' keyword to work as current `multiprocessing'
     is not quite class-friendly.
-
-    ### IMPORTANT NOTE ###
-    If you have modules returning tensors on CPUs, check out
-        `https://pytorch.org/docs/stable/multiprocessing.html#sharing-strategies',
-    as your system can be easily crippled by queueing a lot of CPU tensors.
     """
 
-    def __init__(self, model_cls, num_jobs=None, maxtasksperchild=256, verbose=False):
+    def __init__(self, model_cls, num_jobs=None, maxtasksperchild=None, verbose=False):
         super(DataParallelCPU, self).__init__()
 
         self.model_cls = model_cls
         self.verbose = verbose
 
-        num_jobs = num_jobs or multiprocessing.cpu_count()
-        self.pool = multiprocessing.Pool(
+        num_jobs = num_jobs or mp.cpu_count()
+
+        ctx = mp.get_context('spawn')
+        self.pool = ctx.Pool(
             num_jobs,
             initializer=_pool_initializer,
             initargs=(model_cls,),
@@ -89,8 +89,8 @@ class DataParallelCPU(DeviceMixin):
     def scatter(self, obj):
         if isinstance(obj, np.ndarray):
             return np.split(obj, len(obj))
-        if isinstance(obj, torch.Tensor):
-            return torch.split(obj, len(obj))
+        # if isinstance(obj, torch.Tensor):
+        #     return torch.split(obj, len(obj))
         if isinstance(obj, (tuple, list)):
             return list(map(type(obj), zip(*map(self.scatter, obj))))
         if isinstance(obj, dict):
@@ -112,12 +112,13 @@ class DataParallelCPU(DeviceMixin):
         if self.verbose:
             args = tqdm.tqdm(total=len(args))
 
-        objs = self.pool.imap_unordered(_pool_func, (
+        objs = self.pool.imap(_pool_func, (
             (num, self.model_cls,) + _args
             for (num, _args) in enumerate(args)
         ))
+
         objs = dict(objs)
-        objs = [objs[num] for num in range(len(objs))]
+        objs = [torch.as_tensor(objs[num]) for num in range(len(objs))]
         objs = self.gather(objs).to(self.device)
 
         return objs

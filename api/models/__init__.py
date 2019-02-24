@@ -3,12 +3,12 @@ import torch
 import torch.nn as nn
 
 from api import Mode, Phase
-from api.models.base import DataParallelCPU, ExponentialMovingAverage
 from api.models.cnn import DenseNet121, ResNet50
 from api.models.rnn import ReportDecoder, SentenceDecoder
-from api.models.nondiff import SentIndex2Report, CheXpert, CheXpertAggregator
 from api.utils import profile
+from api.utils.io import load_state_dict
 from api.utils.rnn import expand_to_sequence, pack_padded_sequence
+from api.utils.log import print_batch
 
 logger = logging.getLogger(__name__)
 
@@ -18,16 +18,22 @@ class Model(nn.Module):
         super(Model, self).__init__()
 
         self.mode           = Mode[kwargs['mode']]
+        self.image_size     = kwargs['image_size']
         self.embedding_size = kwargs['embedding_size']
         self.label_size     = kwargs['label_size']
         self.dropout        = kwargs['dropout']
 
         self.__use_densenet = kwargs['__use_densenet']
 
-        if self.__use_densenet:
-            self.image_encoder = DenseNet121(**kwargs)
-        else:
-            self.image_encoder = ResNet50(**kwargs)
+        if self.mode & Mode.enc_image:
+            if self.__use_densenet:
+                self.image_encoder = DenseNet121(**kwargs)
+
+                path = os.path.join(os.path.dirname(__file__), os.pardir, 'checkpoints', 'model.pkl')
+                logger.info(f'Loading model from {path}')
+                load_state_dict(self.image_encoder, torch.load(path)['state_dict'])
+            else:
+                self.image_encoder = ResNet50(**kwargs)
 
         if self.mode & Mode.gen_label_all:
             self.fc_label = nn.Linear(self.embedding_size, self.label_size)
@@ -49,7 +55,8 @@ class Model(nn.Module):
         elif phase in [Phase.val, Phase.test]:
             self.eval()
 
-        output.update(self.image_encoder(output))
+        if self.mode & Mode.enc_image:
+            output.update(self.image_encoder(output))
 
         if self.mode & Mode.gen_label_all:
             output['_label'] = torch.sigmoid(self.fc_label(self.drop(output['image'].mean(1))))

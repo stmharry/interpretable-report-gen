@@ -1,12 +1,4 @@
-""" TODO """
-# scenarios
-# - find best seqs to eval at test time
-
-# baselines
-# - nn in image space and return associated report: Harry
-# - TieNet: generous/mean/mean + 1 std: GX
-# - whole report gen: Harry
-# - markov chain on clustered images
+import grequests
 
 import datetime
 import functools
@@ -15,6 +7,7 @@ import json
 import logging
 import matplotlib
 import matplotlib.pyplot as plot
+import multiprocessing
 import os
 import pandas as pd
 import sklearn.metrics
@@ -39,8 +32,8 @@ from api import Mode, Phase
 from api.datasets import MimicCXRDataset
 from api.data_loader import CollateFn
 from api.models import Model
-from api.models.base import ExponentialMovingAverage
-from api.models.nondiff import SentIndex2Report, CheXpertAggregator, CheXpertRemote
+from api.models.base import DataParallelCPU, ExponentialMovingAverage
+from api.models.nondiff import SentIndex2Report, CheXpert
 from api.metrics import Bleu, Rouge, CiderD as Cider, MentionSim
 from api.utils import to_numpy, profile
 from api.utils.io import version_of, load_state_dict
@@ -84,6 +77,7 @@ flags.DEFINE_integer('batch_size', 16, 'Batch size (default: 16)')
 flags.DEFINE_integer('num_epochs', 64, 'Number of training epochs (default: 64)')
 flags.DEFINE_integer('save_epochs', 1, 'Save model per # epochs (default: 1)')
 flags.DEFINE_float('weight_sim', 1e1, 'Weighting for similarity reward (default: 1e1)')
+flags.DEFINE_integer('sim_steps', 10, 'Only optimize similarity reward per # steps(default: 10)')
 flags.DEFINE_float('lr', 1e-3, 'Learning rate (default: 1e-3)')
 flags.DEFINE_float('lr_decay', 0.5, 'Learning rate decay (default: 0.5)')
 flags.DEFINE_integer('lr_decay_epochs', 8, 'Learning rate decay per # epochs (default: 8)')
@@ -175,11 +169,6 @@ def train():
     })
 
     model = Model(**kwargs)
-    if kwargs['__use_densenet']:
-        path = os.path.join(os.path.dirname(__file__), 'checkpoints', 'model.pkl')
-        logger.info(f'Loading model from {path}')
-        load_state_dict(model.image_encoder, torch.load(path)['state_dict'])
-
     model = DataParallel(model).to(FLAGS.device)
     logger.info(f'Model info:\n{model}')
 
@@ -198,15 +187,7 @@ def train():
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, FLAGS.lr_decay_epochs, FLAGS.lr_decay)
 
     converter = SentIndex2Report(index_to_word=MimicCXRDataset.index_to_word)
-    chexpert = CheXpertRemote(urls=[
-        'http://gray.csail.mit.edu:9478',
-        'http://harrison.csail.mit.edu:9478',
-        'http://visiongpu04.csail.mit.edu:9478',
-        'http://visiongpu05.csail.mit.edu:9478',
-        'http://visiongpu12.csail.mit.edu:9478',
-        'http://visiongpu14.csail.mit.edu:9478',
-    ]).to(FLAGS.device)
-    # chexpert_aggregator = CheXpertAggregator().to(FLAGS.device)
+    chexpert = DataParallelCPU(CheXpert, num_jobs=32, maxtasksperchild=256).to(FLAGS.device)
     bleu = Bleu(4).to(FLAGS.device)
     rouge = Rouge().to(FLAGS.device)
     cider = Cider(df_cache=MimicCXRDataset.df_cache).to(FLAGS.device)
@@ -306,27 +287,30 @@ def train():
                             output_greedy = model(batch, phase=Phase.test, beam_size=1)
                         _report_greedy = converter(output_greedy['_text'][:, 0], output_greedy['_sent_length'][:, 0], output_greedy['_text_length'])
 
+                        reward = 0
+
                         report_cider = cider(_report, report)
                         report_cider_greedy = cider(_report_greedy, report)
+                        reward_report = report_cider - report_cider_greedy
+                        reward += reward_report
 
                         metrics['cider'] = report_cider.mean()
+                        metrics['reward_report'] = reward_report.mean()
 
-                        # _chexpert_label_sent = chexpert(_report_sent)
-                        # _chexpert_label = chexpert_aggregator(_chexpert_label_sent, output['_text_length'])
-                        _chexpert_label = chexpert(_report)
-                        sim = mention_sim(_chexpert_label, output['chexpert_label'])
-                        sim_baseline = ema(sim.mean())
+                        if num_step % FLAGS.sim_steps == 0:
+                            # _chexpert_label_sent = chexpert(_report_sent)
+                            # _chexpert_label = chexpert_aggregator(_chexpert_label_sent, output['_text_length'])
+                            _chexpert_label = chexpert(_report)
+                            sim = mention_sim(_chexpert_label, output['chexpert_label'])
+                            sim_baseline = ema(sim.mean())
 
-                        metrics['sim'] = sim.mean()
+                            metrics['sim'] = sim.mean()
 
-                        reward_report = report_cider - report_cider_greedy
-                        reward_sim = sim - sim_baseline
-                        reward = reward_report + FLAGS.weight_sim * reward_sim
+                            reward_sim = sim - sim_baseline
+                            reward += FLAGS.weight_sim * reward_sim
+                            metrics['reward_sim'] = reward_sim.mean()
 
                         losses['REINFORCE'] = - (_sum_log_probability * reward).mean()
-
-                        metrics['reward_report'] = reward_report.mean()
-                        metrics['reward_sim'] = reward_sim.mean()
                         metrics['reward'] = reward.mean()
 
                 elif phase == Phase.val:
@@ -417,6 +401,7 @@ def train():
             if phase == Phase.train:
                 if num_epoch % FLAGS.save_epochs == 0:
                     torch.save(model.state_dict(), os.path.join(working_dir, f'model-epoch-{num_epoch}.pth'))
+                    torch.save(optimizer.state_dict(), os.path.join(working_dir, f'optimizer-epoch-{num_epoch}.pth'))
 
             elif phase == Phase.val:
                 if (mode & Mode.use_label_all_ce) or (mode & Mode.use_label_ce):
@@ -603,5 +588,8 @@ if __name__ == '__main__':
     mode = Mode[FLAGS.mode]
     if FLAGS.debug:
         FLAGS.num_workers = 0
+    if mode & Mode.as_one_sentence:
+        FLAGS.max_report_length = 1
+        FLAGS.max_sentence_length = 120
 
     locals()[FLAGS.do]()

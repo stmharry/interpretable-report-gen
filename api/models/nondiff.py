@@ -61,7 +61,7 @@ class CheXpert(DeviceMixin):
             s: numpy array of strings.
 
         Returns:
-            labels (np.int64): annotation of diseases, the meaning of which is
+            labels (torch.int64): annotation of diseases, the meaning of which is
                 1) 3: potisitive mention
                 2) 2: negative mention
                 3) 1: uncertain mention
@@ -115,22 +115,25 @@ class CheXpertAggregator(nn.Module):
 
 
 class CheXpertRemote(DeviceMixin):
-    def __init__(self, urls, timeout=4.0):
+    def __init__(self, urls, local):
         super(CheXpertRemote).__init__()
 
         self.urls = urls
-        self.timeout = timeout
+        self.local = local
 
-    def forward(self, s):
-        if not isinstance(s, np.ndarray):
-            s = np.array([s], dtype=object)
+    def forward(self, x):
+        if not isinstance(x, np.ndarray):
+            x = np.array([x], dtype=object)
 
-        s_list = np.array_split(s, len(self.urls))
-        rs = [grequests.post(url, json=s.tolist()) for (url, s) in zip(self.urls, s_list)]
-        rs = grequests.map(rs)
+        xs = np.array_split(x, len(self.urls))
+        objs = [grequests.post(url, json=x.tolist()) for (url, x) in zip(self.urls, xs)]
+        objs = grequests.map(objs)
+        for (num, obj) in enumerate(objs):
+            if obj is None:
+                objs[num] = self.local(xs[num])
+            else:
+                objs[num] = torch.as_tensor(obj.json(), dtype=torch.long, device=self.device)
 
-        objs = sum([r.json() for r in rs], [])
-        labels = torch.as_tensor(objs, dtype=torch.long, device=self.device)
-        return labels
+        return torch.cat(objs)
 
     __call__ = forward
