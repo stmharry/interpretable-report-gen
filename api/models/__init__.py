@@ -1,4 +1,5 @@
 import logging
+import os
 import torch
 import torch.nn as nn
 
@@ -29,7 +30,7 @@ class Model(nn.Module):
             if self.__use_densenet:
                 self.image_encoder = DenseNet121(**kwargs)
 
-                path = os.path.join(os.path.dirname(__file__), os.pardir, 'checkpoints', 'model.pkl')
+                path = os.path.join(os.path.dirname(__file__), os.pardir, os.pardir, 'checkpoints', 'model.pkl')
                 logger.info(f'Loading model from {path}')
                 load_state_dict(self.image_encoder, torch.load(path)['state_dict'])
             else:

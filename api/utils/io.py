@@ -3,12 +3,15 @@ import json
 import os
 
 
-def load_state_dict(model, state_dict):
-    try:
-        model.load_state_dict(state_dict, strict=True)
-    except Exception as e:
-        print(e)
-        model.load_state_dict(state_dict, strict=False)
+def load_state_dict(obj, state_dict, use_strict=True):
+    if use_strict:
+        try:
+            obj.load_state_dict(state_dict, strict=True)
+        except Exception as e:
+            print(e)
+            obj.load_state_dict(state_dict, strict=False)
+    else:
+        obj.load_state_dict(state_dict)
 
 
 def version_of(ckpt_path, ascend=False):

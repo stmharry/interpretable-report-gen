@@ -10,6 +10,7 @@ import matplotlib.pyplot as plot
 import multiprocessing
 import os
 import pandas as pd
+import re
 import sklearn.metrics
 import sys
 import torch
@@ -33,7 +34,7 @@ from api.datasets import MimicCXRDataset
 from api.data_loader import CollateFn
 from api.models import Model
 from api.models.base import DataParallelCPU, ExponentialMovingAverage
-from api.models.nondiff import SentIndex2Report, CheXpert
+from api.models.nondiff import SentIndex2Report, CheXpert, CheXpertAggregator
 from api.metrics import Bleu, Rouge, CiderD as Cider, MentionSim
 from api.utils import to_numpy, profile
 from api.utils.io import version_of, load_state_dict
@@ -77,7 +78,8 @@ flags.DEFINE_integer('batch_size', 16, 'Batch size (default: 16)')
 flags.DEFINE_integer('num_epochs', 64, 'Number of training epochs (default: 64)')
 flags.DEFINE_integer('save_epochs', 1, 'Save model per # epochs (default: 1)')
 flags.DEFINE_float('weight_sim', 1e1, 'Weighting for similarity reward (default: 1e1)')
-flags.DEFINE_integer('sim_steps', 10, 'Only optimize similarity reward per # steps(default: 10)')
+flags.DEFINE_integer('sim_steps', 10, 'Only optimize similarity reward per # steps (default: 10)')
+flags.DEFINE_float('prob_anneal', 1e-2, 'Annealing the probability of reinforcement learning (default: 1e-2)')
 flags.DEFINE_float('lr', 1e-3, 'Learning rate (default: 1e-3)')
 flags.DEFINE_float('lr_decay', 0.5, 'Learning rate decay (default: 0.5)')
 flags.DEFINE_integer('lr_decay_epochs', 8, 'Learning rate decay per # epochs (default: 8)')
@@ -85,7 +87,8 @@ flags.DEFINE_float('tf_decay', 0.0, 'Teacher forcing ratio decay (default: 0.0)'
 flags.DEFINE_integer('tf_decay_epochs', 8, 'Teacher forcing ratio decay (default: 8)')
 flags.DEFINE_integer('log_steps', 10, 'Logging per # steps for numerical values (default: 10)')
 flags.DEFINE_integer('log_text_steps', 100, 'Logging per # steps for text (default: 100)')
-flags.DEFINE_string('ckpt_path', None, 'Checkpoint path to load (default: None)')
+flags.DEFINE_string('ckpt_path', None, 'Checkpoint path to load model (default: None)')
+flags.DEFINE_string('optim_path', None, 'Checkpoint path to load for optimizer (default: None)')
 flags.DEFINE_string('working_dir', os.getenv('WORKING_DIR'), 'Working directory (default: $WORKING_DIR)')
 FLAGS = flags.FLAGS
 
@@ -172,9 +175,22 @@ def train():
     model = DataParallel(model).to(FLAGS.device)
     logger.info(f'Model info:\n{model}')
 
+    optimizer = torch.optim.Adam(model.parameters(), lr=FLAGS.lr)
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, FLAGS.lr_decay_epochs, FLAGS.lr_decay)
+
     if FLAGS.ckpt_path:
         logger.info(f'Loading model from {FLAGS.ckpt_path}')
         load_state_dict(model, torch.load(FLAGS.ckpt_path))
+
+        begin_epoch = re.findall('model-epoch-(\d*).pth', FLAGS.ckpt_path)
+        if begin_epoch:
+            begin_epoch = int(begin_epoch[0]) + 1
+        else:
+            begin_epoch = 0
+
+    if FLAGS.optim_path:
+        logger.info(f'Loading optimizer from {FLAGS.optim_path}')
+        load_state_dict(optimizer, torch.load(FLAGS.optim_path), use_strict=False)
 
     if FLAGS.debug:
         working_dir = os.path.join(FLAGS.working_dir, 'debug')
@@ -183,11 +199,10 @@ def train():
 
     working_dir = os.path.join(working_dir, datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S-%f'))
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=FLAGS.lr)
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, FLAGS.lr_decay_epochs, FLAGS.lr_decay)
-
     converter = SentIndex2Report(index_to_word=MimicCXRDataset.index_to_word)
-    chexpert = DataParallelCPU(CheXpert, num_jobs=32, maxtasksperchild=256).to(FLAGS.device)
+    chexpert = DataParallelCPU(CheXpert, num_jobs=None, maxtasksperchild=256).to(FLAGS.device)
+    chexpert_aggregator = CheXpertAggregator().to(FLAGS.device)
+
     bleu = Bleu(4).to(FLAGS.device)
     rouge = Rouge().to(FLAGS.device)
     cider = Cider(df_cache=MimicCXRDataset.df_cache).to(FLAGS.device)
@@ -217,8 +232,8 @@ def train():
     """ Training Loop
     """
 
-    for num_epoch in range(num_epochs):
-        scheduler.step()
+    for num_epoch in range(begin_epoch, begin_epoch + num_epochs):
+        scheduler.step(num_epoch)
 
         if mode & Mode.use_teacher_forcing:
             teacher_forcing_ratio = max(0, 1 - (num_epoch // FLAGS.tf_decay_epochs) * FLAGS.tf_decay)
@@ -280,7 +295,7 @@ def train():
                     if mode & Mode.use_self_critical:
                         report = converter(output['text'], output['sent_length'], output['text_length'])
                         _report = converter(output['_text'][:, 0], output['_sent_length'][:, 0], output['_text_length'])
-                        # _report_sent = converter(output['_text'][:, 0], output['_sent_length'][:, 0], torch.ones_like(output['_sent_length'][:, 0]))
+                        _report_sent = converter(output['_text'][:, 0], output['_sent_length'][:, 0], torch.ones_like(output['_sent_length'][:, 0]))
                         _sum_log_probability = pad_packed_sequence(output['_sum_log_probability'][:, 0], length=output['_text_length']).sum(1)
 
                         with torch.no_grad():
@@ -298,9 +313,9 @@ def train():
                         metrics['reward_report'] = reward_report.mean()
 
                         if num_step % FLAGS.sim_steps == 0:
-                            # _chexpert_label_sent = chexpert(_report_sent)
-                            # _chexpert_label = chexpert_aggregator(_chexpert_label_sent, output['_text_length'])
-                            _chexpert_label = chexpert(_report)
+                            _chexpert_label_sent = chexpert(_report_sent)
+                            _chexpert_label = chexpert_aggregator(_chexpert_label_sent, output['_text_length'])
+                            # _chexpert_label = chexpert(_report)
                             sim = mention_sim(_chexpert_label, output['chexpert_label'])
                             sim_baseline = ema(sim.mean())
 
@@ -310,7 +325,7 @@ def train():
                             reward += FLAGS.weight_sim * reward_sim
                             metrics['reward_sim'] = reward_sim.mean()
 
-                        losses['REINFORCE'] = - (_sum_log_probability * reward).mean()
+                        losses['REINFORCE'] = - (FLAGS.prob_anneal * _sum_log_probability * reward).mean()
                         metrics['reward'] = reward.mean()
 
                 elif phase == Phase.val:
@@ -584,6 +599,8 @@ if __name__ == '__main__':
 
     matplotlib.use('Agg')
     warnings.filterwarnings('ignore')
+
+    torch.backends.cudnn.benchmark = True
 
     mode = Mode[FLAGS.mode]
     if FLAGS.debug:
