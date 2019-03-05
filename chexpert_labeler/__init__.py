@@ -2,9 +2,9 @@ import functools
 
 from pathlib import Path
 
-from chexpert.loader import Loader
-from chexpert.stages import Extractor, Classifier, Aggregator
-from chexpert.constants import CATEGORIES, REPORTS
+from chexpert_labeler.loader import Loader
+from chexpert_labeler.stages import Extractor, Classifier, Aggregator
+from chexpert_labeler.constants import CATEGORIES
 
 working_dir = Path(__file__).parent
 

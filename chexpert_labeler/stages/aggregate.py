@@ -2,7 +2,7 @@
 import numpy as np
 from tqdm import tqdm
 
-from chexpert.constants import *
+from chexpert_labeler.constants import *
 
 
 class Aggregator(object):

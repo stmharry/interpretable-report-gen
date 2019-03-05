@@ -29,8 +29,9 @@ class CiderScorer(_CiderScorer):
 
 
 class CiderD(_CiderD, MetricMixin):
-    def __init__(self, df_cache, *args, **kwargs):
-        super(CiderD, self).__init__(*args, **kwargs)
+    def __init__(self, df_cache):
+        _CiderD.__init__(self)
+        MetricMixin.__init__(self)
 
         self.df_cache = df_cache
 
@@ -46,6 +47,10 @@ class CiderD(_CiderD, MetricMixin):
 
 
 class Bleu(_Bleu, MetricMixin):
+    def __init__(self, n):
+        _Bleu.__init__(self, n)
+        MetricMixin.__init__(self)
+
     def compute_score(self, gts, res):
         bleu_scorer = BleuScorer(n=self._n)
 
@@ -56,4 +61,6 @@ class Bleu(_Bleu, MetricMixin):
 
 
 class Rouge(_Rouge, MetricMixin):
-    pass
+    def __init__(self):
+        _Rouge.__init__(self)
+        MetricMixin.__init__(self)

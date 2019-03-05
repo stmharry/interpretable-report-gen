@@ -4,7 +4,7 @@ import bioc
 import pandas as pd
 from negbio.pipeline import text2bioc, ssplit, section_split
 
-from chexpert.constants import *
+from chexpert_labeler.constants import *
 
 
 class Loader(object):

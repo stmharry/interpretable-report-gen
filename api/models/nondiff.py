@@ -3,11 +3,11 @@ import numpy as np
 import psutil
 import os
 import re
-import grequests
+# import grequests
 import torch
 import torch.nn as nn
 
-import chexpert
+import chexpert_labeler
 
 from api import Token
 from api.models.base import DeviceMixin
@@ -35,9 +35,9 @@ class CheXpert(DeviceMixin):
     def __init__(self):
         super(CheXpert, self).__init__()
 
-        self.extractor = chexpert.Extractor()
-        self.classifier = chexpert.Classifier()
-        self.aggregator = chexpert.Aggregator()
+        self.extractor = chexpert_labeler.Extractor()
+        self.classifier = chexpert_labeler.Classifier()
+        self.aggregator = chexpert_labeler.Aggregator()
 
         self.re_objs = {}
         self.process = psutil.Process(os.getpid())
@@ -50,7 +50,7 @@ class CheXpert(DeviceMixin):
         return self.re_objs[pattern]
 
     def clean(self, s):
-        s = self.get_re_obj(Token.eos).sub('', s)
+        s = self.get_re_obj(Token.eos).sub(' ', s)
         s = self.get_re_obj(r'\.\s*\.').sub('.', s)
         return s
 
@@ -72,18 +72,24 @@ class CheXpert(DeviceMixin):
         if not isinstance(s, np.ndarray):
             s = np.array([s], dtype=object)
 
+        size = len(s)
+
         # stmharry: extra space to ensure the string is not empty
         s = '"' + s + ' "'
         s = '\n'.join(s)
         s = self.clean(s)
 
-        with io.BytesIO(s.encode()) as f:
-            loader = chexpert.Loader(reports_path=f)
-            loader.load()
+        try:
+            with io.BytesIO(s.encode()) as f:
+                loader = chexpert_labeler.Loader(reports_path=f)
+                loader.load()
 
-        self.extractor.extract(loader.collection)
-        self.classifier.classify(loader.collection)
-        labels = self.aggregator.aggregate(loader.collection)
+            self.extractor.extract(loader.collection)
+            self.classifier.classify(loader.collection)
+            labels = self.aggregator.aggregate(loader.collection)
+
+        except:
+            labels = np.asarray([[1] + [np.nan] * (len(chexpert_labeler.CATEGORIES) - 1)] * size)
 
         labels = torch.as_tensor(labels, device=self.device)
         labels = torch.where(torch.isnan(labels), torch.zeros_like(labels), labels + 2).long()
@@ -114,6 +120,7 @@ class CheXpertAggregator(nn.Module):
         return torch.stack(chexpert_labels, 0)
 
 
+'''
 class CheXpertRemote(DeviceMixin):
     def __init__(self, urls, local):
         super(CheXpertRemote).__init__()
@@ -137,3 +144,4 @@ class CheXpertRemote(DeviceMixin):
         return torch.cat(objs)
 
     __call__ = forward
+'''

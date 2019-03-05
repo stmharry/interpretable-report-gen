@@ -110,7 +110,7 @@ class DataParallelCPU(DeviceMixin):
     def __call__(self, *args):
         args = self.scatter(args)
         if self.verbose:
-            args = tqdm.tqdm(total=len(args))
+            args = tqdm.tqdm(args, total=len(args))
 
         objs = self.pool.imap(_pool_func, (
             (num, self.model_cls,) + _args

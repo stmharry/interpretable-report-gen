@@ -41,6 +41,6 @@ class MentionSim(nn.Module):
 
     def forward(self, input_, target):
         lookup = input_ * MentionSim.mention_size + target
-        sim = self._sim_lookup[lookup].mean(1)
+        sim = self._sim_lookup[lookup]
 
         return sim

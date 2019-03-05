@@ -8,6 +8,7 @@ import logging
 import matplotlib
 import matplotlib.pyplot as plot
 import multiprocessing
+import numpy as np
 import os
 import pandas as pd
 import re
@@ -25,6 +26,8 @@ from torch.nn import (
     functional as F,
     DataParallel,
 )
+
+import chexpert_labeler
 
 from mimic_cxr.data import MIMIC_CXR
 from mimic_cxr.utils import Log
@@ -44,7 +47,7 @@ from api.utils.rnn import pack_padded_sequence, pad_packed_sequence
 """ Global
 """
 flags.DEFINE_string('do', 'train', 'Function to execute (default: "train")')
-flags.DEFINE_enum('test_split', 'test', ['val', 'test'], 'Split to test for')
+flags.DEFINE_enum('split', 'test', ['val', 'test'], 'Split to validate/visualize for')
 flags.DEFINE_enum('mode', None, list(Mode.__members__.keys()), 'Training mode (' + ' or '.join(map('"{}"'.format, Mode.__members__)) + ')')
 flags.DEFINE_string('device', 'cuda', 'GPU device to use (default: "cuda")')
 flags.DEFINE_bool('debug', False, 'Turn on debug mode (default: False)')
@@ -87,6 +90,7 @@ flags.DEFINE_float('tf_decay', 0.0, 'Teacher forcing ratio decay (default: 0.0)'
 flags.DEFINE_integer('tf_decay_epochs', 8, 'Teacher forcing ratio decay (default: 8)')
 flags.DEFINE_integer('log_steps', 10, 'Logging per # steps for numerical values (default: 10)')
 flags.DEFINE_integer('log_text_steps', 100, 'Logging per # steps for text (default: 100)')
+flags.DEFINE_integer('begin_epoch', 0, 'Begin training at # epoch, useful for resuming (default: 0)')
 flags.DEFINE_string('ckpt_path', None, 'Checkpoint path to load model (default: None)')
 flags.DEFINE_string('optim_path', None, 'Checkpoint path to load for optimizer (default: None)')
 flags.DEFINE_string('working_dir', os.getenv('WORKING_DIR'), 'Working directory (default: $WORKING_DIR)')
@@ -95,98 +99,12 @@ FLAGS = flags.FLAGS
 
 @profile
 def train():
-    logger.info('Loading MIMIC-CXR')
-    mimic_cxr = MIMIC_CXR()
-
-    logger.info('Loading meta')
-    df_meta = pd.read_csv(mimic_cxr.meta_path())
-
-    logger.info('Loading text features')
-    df_rad = pd.read_csv(mimic_cxr.corpus_path(field=FLAGS.field), sep='\t', dtype=str)
-
-    logger.info('Loading image features')
-    df_dicom = pd.Series(os.listdir(mimic_cxr.image_path())).str.split('.', expand=True)[0].rename('dicom_id').to_frame()
-
-    on_dfs = [
-        ('rad_id', df_rad),
-        ('dicom_id', df_meta),
-        ('dicom_id', df_dicom),
-    ]
-    df = mimic_cxr.inner_merge(on_dfs)
-    logger.info(f'Dataset size={len(df)}')
-
-    train_size = int(0.875 * len(mimic_cxr.train_subject_ids))
-    train_df = df[df.subject_id.isin(mimic_cxr.train_subject_ids[:train_size])]
-    val_df = df[df.subject_id.isin(mimic_cxr.train_subject_ids[train_size:])]
-    test_df = df[df.subject_id.isin(mimic_cxr.test_subject_ids)]
-
-    if FLAGS.debug_subsample:
-        train_df = train_df.sample(n=100)
-        val_df = val_df.sample(n=100)
-        test_df = test_df.sample(n=100)
-
-    version = version_of(FLAGS.ckpt_path)
-    kwargs = FLAGS.flag_values_dict()
-    kwargs.update({
-        '__use_continuous_label': version_of(FLAGS.ckpt_path) > 1548152415,
-        '__no_recurrent_label': version_of(FLAGS.ckpt_path) > 1548347568,
-        '__image_encoder_relu': version_of(FLAGS.ckpt_path) > 1548428102,
-        '__sample_text': version_of(FLAGS.ckpt_path) > 1548708003,
-        '__use_densenet': version_of(FLAGS.ckpt_path, ascend=True) > 1548881554,
-        '__no_temp': version_of(FLAGS.ckpt_path) > 1548881554,
-    })
-    logger.info(json.dumps(kwargs, indent=4))
-
-    Dataset = functools.partial(
-        MimicCXRDataset,
-        field=FLAGS.field,
-        min_word_freq=FLAGS.min_word_freq,
-        max_report_length=FLAGS.max_report_length,
-        max_sentence_length=FLAGS.max_sentence_length,
-        embedding_size=FLAGS.embedding_size,
-        kwargs=kwargs,
-    )
-    dataset = Dataset(df=df, phase=None)
-
-    train_dataset = Dataset(df=train_df, phase=Phase.train)
-    val_dataset   = Dataset(df=val_df,   phase=Phase.val)
-    test_dataset  = Dataset(df=test_df,  phase=Phase.test)
-
-    DataLoader = functools.partial(
-        torch.utils.data.DataLoader,
-        batch_size=FLAGS.batch_size,
-        num_workers=FLAGS.num_workers,
-        collate_fn=CollateFn(sequence_fields=['text', 'label', 'stop', 'sent_length']),
-        pin_memory=True,
-    )
-    train_loader = DataLoader(dataset=train_dataset, shuffle=True)
-    val_loader   = DataLoader(dataset=val_dataset,   shuffle=True)
-    test_loader  = DataLoader(dataset=test_dataset,  shuffle=False)
-
-    kwargs.update({
-        'word_embedding': MimicCXRDataset.word_embedding,
-        'index_to_word': MimicCXRDataset.index_to_word,
-        'word_to_index': MimicCXRDataset.word_to_index,
-        'view_position_size': MimicCXRDataset.view_position_size,
-        'label_size': MimicCXRDataset.label_size,
-    })
-
-    model = Model(**kwargs)
-    model = DataParallel(model).to(FLAGS.device)
-    logger.info(f'Model info:\n{model}')
-
     optimizer = torch.optim.Adam(model.parameters(), lr=FLAGS.lr)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, FLAGS.lr_decay_epochs, FLAGS.lr_decay)
 
     if FLAGS.ckpt_path:
         logger.info(f'Loading model from {FLAGS.ckpt_path}')
         load_state_dict(model, torch.load(FLAGS.ckpt_path))
-
-        begin_epoch = re.findall('model-epoch-(\d*).pth', FLAGS.ckpt_path)
-        if begin_epoch:
-            begin_epoch = int(begin_epoch[0]) + 1
-        else:
-            begin_epoch = 0
 
     if FLAGS.optim_path:
         logger.info(f'Loading optimizer from {FLAGS.optim_path}')
@@ -209,19 +127,19 @@ def train():
     mention_sim = MentionSim(alpha=0.5).to(FLAGS.device)
     ema = ExponentialMovingAverage(beta=0.95).to(FLAGS.device)
 
-    if FLAGS.do == 'train':
-        os.makedirs(working_dir)
-        with open(os.path.join(working_dir, 'meta.json'), 'w') as f:
-            json.dump(FLAGS.flag_values_dict(), f, indent=4)
+    os.makedirs(working_dir)
+    with open(os.path.join(working_dir, 'meta.json'), 'w') as f:
+        json.dump(FLAGS.flag_values_dict(), f, indent=4)
+    writer = SummaryWriter(working_dir)
+    logger.info(f'Writing to {working_dir}')
 
+    if FLAGS.do == 'train':
         torch.save(model, os.path.join(working_dir, f'model-init.pth'))
-        writer = SummaryWriter(working_dir)
-        logger.info(f'Writing to {working_dir}')
 
         num_epochs = FLAGS.num_epochs
         phases = [Phase.train, Phase.val]
 
-    elif FLAGS.do == 'val':
+    elif FLAGS.do == 'test':
         num_epochs = 1
         phases = [Phase.val]
 
@@ -232,7 +150,7 @@ def train():
     """ Training Loop
     """
 
-    for num_epoch in range(begin_epoch, begin_epoch + num_epochs):
+    for num_epoch in range(FLAGS.begin_epoch, FLAGS.begin_epoch + num_epochs):
         scheduler.step(num_epoch)
 
         if mode & Mode.use_teacher_forcing:
@@ -243,11 +161,17 @@ def train():
             log_items = []
 
             if phase == Phase.train:
+                dataset = train_dataset
                 data_loader = train_loader
                 torch.set_grad_enabled(True)
 
             elif phase == Phase.val:
-                data_loader = val_loader
+                if (FLAGS.do == 'test') and (FLAGS.split == 'test'):
+                    dataset = test_dataset
+                    data_loader = test_loader
+                else:
+                    dataset = val_dataset
+                    data_loader = val_loader
                 torch.set_grad_enabled(False)
 
             prog = tqdm.tqdm(enumerate(data_loader), total=len(data_loader))
@@ -295,7 +219,7 @@ def train():
                     if mode & Mode.use_self_critical:
                         report = converter(output['text'], output['sent_length'], output['text_length'])
                         _report = converter(output['_text'][:, 0], output['_sent_length'][:, 0], output['_text_length'])
-                        _report_sent = converter(output['_text'][:, 0], output['_sent_length'][:, 0], torch.ones_like(output['_sent_length'][:, 0]))
+                        # _report_sent = converter(output['_text'][:, 0], output['_sent_length'][:, 0], torch.ones_like(output['_sent_length'][:, 0]))
                         _sum_log_probability = pad_packed_sequence(output['_sum_log_probability'][:, 0], length=output['_text_length']).sum(1)
 
                         with torch.no_grad():
@@ -313,15 +237,15 @@ def train():
                         metrics['reward_report'] = reward_report.mean()
 
                         if num_step % FLAGS.sim_steps == 0:
-                            _chexpert_label_sent = chexpert(_report_sent)
-                            _chexpert_label = chexpert_aggregator(_chexpert_label_sent, output['_text_length'])
-                            # _chexpert_label = chexpert(_report)
+                            # _chexpert_label_sent = chexpert(_report_sent)
+                            # _chexpert_label = chexpert_aggregator(_chexpert_label_sent, output['_text_length'])
+                            _chexpert_label = chexpert(_report)
                             sim = mention_sim(_chexpert_label, output['chexpert_label'])
-                            sim_baseline = ema(sim.mean())
+                            sim_baseline = ema(sim.mean(0))
 
                             metrics['sim'] = sim.mean()
 
-                            reward_sim = sim - sim_baseline
+                            reward_sim = (sim - sim_baseline).mean()
                             reward += FLAGS.weight_sim * reward_sim
                             metrics['reward_sim'] = reward_sim.mean()
 
@@ -340,13 +264,15 @@ def train():
 
                     output = model(batch, phase=Phase.val, **kwargs)
 
+                    log_item = {}
+
                     if mode & Mode.use_label_all_ce:
                         label_all = output['label'].sum(1).clamp(0, 1)
                         _label_all = output['_label']
 
                         losses['label_ce_all'] = F.binary_cross_entropy(_label_all, label_all)
 
-                        log_items.append({
+                        log_item.update({
                             'label_all': label_all,
                             '_label_all': _label_all,
                         })
@@ -363,7 +289,7 @@ def train():
                         metrics['label_ce_first'] = F.binary_cross_entropy(_label_first, label_first)
                         metrics['label_ce_all'] = F.binary_cross_entropy(_label_all, label_all)
 
-                        log_items.append({
+                        log_item.update({
                             'label_all': label_all,
                             '_label_all': _label_all,
                         })
@@ -385,6 +311,15 @@ def train():
                         sim = mention_sim(_chexpert_label, output['chexpert_label'])
 
                         metrics['sim'] = sim.mean()
+
+                        if FLAGS.do == 'test':
+                            log_item.update({
+                                'item_index': batch['item_index'],
+                                '_report': _report,
+                                '_label_chexpert': _chexpert_label,
+                            })
+
+                    log_items.append(log_item)
 
                 if phase == Phase.train:
                     total_loss = sum(losses.values())
@@ -432,30 +367,44 @@ def train():
                         'AP__micro_': sklearn.metrics.average_precision_score(to_numpy(label_all), to_numpy(_label_all), average='micro'),
                     })
 
-                if FLAGS.do == 'train':
-                    writer.add_log(log, prefix=phase, global_step=num_step)
+                writer.add_log(log, prefix=phase, global_step=num_step)
 
     if FLAGS.do == 'train':
         writer.close()
 
-    elif FLAGS.do == 'val':
+    elif FLAGS.do == 'test':
+        if mode & Mode.gen_text:
+            item_index = np.concatenate([to_numpy(log_item['item_index']) for log_item in log_items], axis=0)
+            _label_chexpert = np.concatenate([to_numpy(log_item['_label_chexpert']) for log_item in log_items], axis=0)
+            _report = np.concatenate([log_item['_report'] for log_item in log_items], axis=0)
+
+            data = np.stack((
+                [dataset.df.rad_id.iloc[item_index]] +
+                list(_label_chexpert.T) +
+                [_report]
+            ), axis=1)
+            columns = ['rad_id'] + chexpert_labeler.CATEGORIES + ['text']
+            df = pd.DataFrame(data, columns=columns)
+
+            df.to_csv(os.path.join(working_dir, 'output.tsv'), sep='\t', index=False)
+
         logger.info('\n'.join(
             [f'{key:s}: {log[key]:8.2e}' for key in log.keys()]
         ))
 
 
-val = train
+test = train
 
 
-def test():
+def vis():
     def to_str(x):
         return '{:.2f}'.format(x.item())
 
-    phase = FLAGS.test_split
+    phase = FLAGS.split
     (data_loader, dataset) = {
         Phase.val: (val_loader, val_dataset),
         Phase.test: (test_loader, test_dataset),
-    }[FLAGS.test_split]
+    }[FLAGS.split]
 
     log = Log()
     converter = SentIndex2Report(index_to_word=MimicCXRDataset.index_to_word)
@@ -482,7 +431,7 @@ def test():
             [f'{key:s}: {log[key]:8.2e}' for key in sorted(losses.keys())]
         ))
 
-        if FLAGS.test_split == 'val':
+        if FLAGS.split == 'val':
             report_texts = convert(batch['text'], batch['sent_length'], batch['text_length'])
 
         item_index = batch['item_index']
@@ -568,7 +517,7 @@ def test():
                 'image': str(img(src=f'http://monday.csail.mit.edu/xiuming{image_path}', width='256')),
                 'generated text': sentences,
             }
-            if FLAGS.test_split == 'val':
+            if FLAGS.split == 'val':
                 report['ground truth text'] = report_texts[num_report]
 
             reports.append(report)
@@ -608,5 +557,85 @@ if __name__ == '__main__':
     if mode & Mode.as_one_sentence:
         FLAGS.max_report_length = 1
         FLAGS.max_sentence_length = 120
+
+    logger.info('Loading MIMIC-CXR')
+    mimic_cxr = MIMIC_CXR()
+
+    logger.info('Loading meta')
+    df_meta = pd.read_csv(mimic_cxr.meta_path())
+
+    logger.info('Loading text features')
+    df_rad = pd.read_csv(mimic_cxr.corpus_path(field=FLAGS.field), sep='\t', dtype=str)
+
+    logger.info('Loading image features')
+    df_dicom = pd.Series(os.listdir(mimic_cxr.image_path())).str.split('.', expand=True)[0].rename('dicom_id').to_frame()
+
+    on_dfs = [
+        ('rad_id', df_rad),
+        ('dicom_id', df_meta),
+        ('dicom_id', df_dicom),
+    ]
+    df = mimic_cxr.inner_merge(on_dfs)
+    logger.info(f'Dataset size={len(df)}')
+
+    train_size = int(0.875 * len(mimic_cxr.train_subject_ids))
+    train_df = df[df.subject_id.isin(mimic_cxr.train_subject_ids[:train_size])]
+    val_df = df[df.subject_id.isin(mimic_cxr.train_subject_ids[train_size:])]
+    test_df = df[df.subject_id.isin(mimic_cxr.test_subject_ids)]
+
+    if FLAGS.debug_subsample:
+        train_df = train_df.sample(n=100)
+        val_df = val_df.sample(n=100)
+        test_df = test_df.sample(n=100)
+
+    version = version_of(FLAGS.ckpt_path)
+    kwargs = FLAGS.flag_values_dict()
+    kwargs.update({
+        '__use_continuous_label': version_of(FLAGS.ckpt_path) > 1548152415,
+        '__no_recurrent_label': version_of(FLAGS.ckpt_path) > 1548347568,
+        '__image_encoder_relu': version_of(FLAGS.ckpt_path) > 1548428102,
+        '__sample_text': version_of(FLAGS.ckpt_path) > 1548708003,
+        '__use_densenet': version_of(FLAGS.ckpt_path, ascend=True) > 1548881554,
+        '__no_temp': version_of(FLAGS.ckpt_path) > 1548881554,
+    })
+    logger.info(json.dumps(kwargs, indent=4))
+
+    Dataset = functools.partial(
+        MimicCXRDataset,
+        field=FLAGS.field,
+        min_word_freq=FLAGS.min_word_freq,
+        max_report_length=FLAGS.max_report_length,
+        max_sentence_length=FLAGS.max_sentence_length,
+        embedding_size=FLAGS.embedding_size,
+        kwargs=kwargs,
+    )
+    dataset = Dataset(df=df, phase=None)
+
+    kwargs.update({
+        'word_embedding': MimicCXRDataset.word_embedding,
+        'index_to_word': MimicCXRDataset.index_to_word,
+        'word_to_index': MimicCXRDataset.word_to_index,
+        'view_position_size': MimicCXRDataset.view_position_size,
+        'label_size': MimicCXRDataset.label_size,
+    })
+
+    train_dataset = Dataset(df=train_df, phase=Phase.train)
+    val_dataset   = Dataset(df=val_df,   phase=Phase.val)
+    test_dataset  = Dataset(df=test_df,  phase=Phase.test)
+
+    DataLoader = functools.partial(
+        torch.utils.data.DataLoader,
+        batch_size=FLAGS.batch_size,
+        num_workers=FLAGS.num_workers,
+        collate_fn=CollateFn(sequence_fields=['text', 'label', 'stop', 'sent_length']),
+        pin_memory=True,
+    )
+    train_loader = DataLoader(dataset=train_dataset, shuffle=True)
+    val_loader   = DataLoader(dataset=val_dataset,   shuffle=True)
+    test_loader  = DataLoader(dataset=test_dataset,  shuffle=False)
+
+    model = Model(**kwargs)
+    model = DataParallel(model).to(FLAGS.device)
+    logger.info(f'Model info:\n{model}')
 
     locals()[FLAGS.do]()
