@@ -15,7 +15,7 @@ from api.models.nondiff import CheXpert
 from api.metrics import Bleu, Rouge, CiderD as Cider, MentionSim
 from api.utils import to_numpy
 
-flags.DEFINE_string('csv_path', None, 'csv file to evaluate')
+flags.DEFINE_string('path', None, 'File to evaluate')
 flags.DEFINE_list('remove_tokens', [], 'Tokens to strip, separated by comma')
 FLAGS = flags.FLAGS
 
@@ -29,14 +29,18 @@ if __name__ == '__main__':
     rouge = Rouge()
     cider = Cider(df_cache=torch.load(os.path.join(os.getenv('CACHE_DIR'), 'cider-cache.pkl')))
 
-    _df = pd.read_csv(FLAGS.csv_path, sep='\t')
+    _df = pd.read_csv(FLAGS.path, sep='\t').fillna('')
     df_sentence = pd.read_csv(os.path.join(os.getenv('CACHE_DIR'), f'sentence-label-field-findings.tsv'), sep='\t')
     df_chexpert = pd.read_csv(os.path.join(os.getenv('CACHE_DIR'), f'report-chexpert-field-findings.tsv'), sep='\t')
 
+    rad_ids = set(_df.rad_id) & set(df_sentence.rad_id)
+
     df = pd.merge(
-        df_sentence.loc[df_sentence.rad_id.isin(_df.rad_id)].groupby('rad_id').sentence.apply(' '.join).rename('text').reset_index(),
-        df_chexpert.loc[df_chexpert.rad_id.isin(_df.rad_id)],
+        df_sentence.loc[df_sentence.rad_id.isin(rad_ids)].groupby('rad_id').sentence.apply(' '.join).rename('text').reset_index(),
+        df_chexpert.loc[df_chexpert.rad_id.isin(rad_ids)],
     )
+
+    _df = _df[_df.rad_id.isin(rad_ids)]
     df = _df[['rad_id']].merge(df)
 
     print('Evaluating NLP metrics...')
@@ -62,10 +66,11 @@ if __name__ == '__main__':
 
     label = df[chexpert_labeler.CATEGORIES].values
     if all(map(_df.columns.__contains__, chexpert_labeler.CATEGORIES)):
+        chexpert = None
         _label = _df[chexpert_labeler.CATEGORIES].values
     else:
         chexpert = DataParallelCPU(CheXpert, num_jobs=None, maxtasksperchild=256, verbose=True)
-        _label = chexpert(_df.text.values)
+        _label = to_numpy(chexpert(_df.text.values))
 
     acc = np.array([
         1.0, np.nan, 1.0, 0.0,
@@ -83,3 +88,6 @@ if __name__ == '__main__':
     print('=' * 32)
     print(metric_mean)
     print('=' * 32)
+
+    if chexpert is not None:
+        chexpert.close()

@@ -5,7 +5,7 @@ import torch.nn as nn
 
 from api import Mode, Phase
 from api.models.cnn import DenseNet121, ResNet50
-from api.models.rnn import ReportDecoder, SentenceDecoder
+from api.models.rnn import SentenceDecoder, WordDecoder
 from api.utils import profile
 from api.utils.io import load_state_dict
 from api.utils.rnn import expand_to_sequence, pack_padded_sequence
@@ -41,10 +41,10 @@ class Model(nn.Module):
             self.drop = nn.Dropout(self.dropout)
 
         if self.mode & Mode.gen_label:
-            self.report_decoder = ReportDecoder(**kwargs)
+            self.sentence_decoder = SentenceDecoder(**kwargs)
 
         if self.mode & Mode.gen_text:
-            self.sentence_decoder = SentenceDecoder(**kwargs)
+            self.word_decoder = WordDecoder(**kwargs)
 
     @profile
     def forward(self, batch, phase, **kwargs):
@@ -64,10 +64,10 @@ class Model(nn.Module):
 
         if self.mode & Mode.gen_label:
             if (phase == Phase.train) and (self.mode & Mode.use_self_critical) or (phase in [Phase.val, Phase.test]):
-                output.update(self.report_decoder._test(output, **kwargs))
+                output.update(self.sentence_decoder._test(output, **kwargs))
                 _text_length = output['_text_length']
             else:
-                output.update(self.report_decoder._train(output, length=output['text_length'], **kwargs))
+                output.update(self.sentence_decoder._train(output, length=output['text_length'], **kwargs))
                 _text_length = output['text_length']
 
             for key in ['image', 'view_position']:
@@ -81,12 +81,12 @@ class Model(nn.Module):
                     output[key] = pack_padded_sequence(output[key], length=output['text_length'])
 
             if (phase == Phase.train) and (self.mode & Mode.use_teacher_forcing):
-                output.update(self.sentence_decoder._train(output, length=output['sent_length'], **kwargs))
+                output.update(self.word_decoder._train(output, length=output['sent_length'], **kwargs))
 
             elif (phase == Phase.train) and (self.mode & Mode.use_self_critical):
-                output.update(self.sentence_decoder._test(output, probabilistic=True, **kwargs))
+                output.update(self.word_decoder._test(output, probabilistic=True, **kwargs))
 
             elif phase in [Phase.val, Phase.test]:
-                output.update(self.sentence_decoder._test(output, probabilistic=False, **kwargs))
+                output.update(self.word_decoder._test(output, probabilistic=False, **kwargs))
 
         return output

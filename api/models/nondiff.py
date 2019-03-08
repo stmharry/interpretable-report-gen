@@ -19,14 +19,17 @@ class SentIndex2Report(object):
     def __init__(self, index_to_word):
         self.index_to_word = index_to_word
 
-    def forward(self, sent, sent_length, text_length):
+    def forward(self, sent, sent_length, text_length, is_eos=True):
+        if not is_eos:
+            sent_length = sent_length - 1
+
         word = pack_padded_sequence(sent, length=sent_length)
         length = pad_packed_sequence(sent_length, length=text_length).sum(1)
 
         word = self.index_to_word[to_numpy(word)]
         words = np.split(word, np.cumsum(to_numpy(length)))[:-1]
 
-        return np.array([' '.join(word) for word in words], dtype=object)
+        return np.array(list(map(' '.join, words)), dtype=object)
 
     __call__ = forward
 

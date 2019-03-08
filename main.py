@@ -54,6 +54,8 @@ flags.DEFINE_bool('debug', False, 'Turn on debug mode (default: False)')
 flags.DEFINE_bool('debug_subsample', False, 'Turn on subsampling for debugging (default: False)')
 flags.DEFINE_string('debug_use_dataset', None, 'Turn on alternate dataset postfix (default: None)')
 flags.DEFINE_bool('debug_one_sentence', False, 'Turn on one sentence mode (default: False)')
+flags.DEFINE_bool('debug_use_resnet', False, '')
+flags.DEFINE_bool('debug_disable_chexpert', False, '')
 flags.DEFINE_bool('profile', False, 'Turn on profiling mode (default: False)')
 
 """ Image
@@ -117,15 +119,16 @@ def train():
 
     working_dir = os.path.join(working_dir, datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S-%f'))
 
-    converter = SentIndex2Report(index_to_word=MimicCXRDataset.index_to_word)
-    chexpert = DataParallelCPU(CheXpert, num_jobs=None, maxtasksperchild=256).to(FLAGS.device)
-    chexpert_aggregator = CheXpertAggregator().to(FLAGS.device)
-
     bleu = Bleu(4).to(FLAGS.device)
     rouge = Rouge().to(FLAGS.device)
     cider = Cider(df_cache=MimicCXRDataset.df_cache).to(FLAGS.device)
-    mention_sim = MentionSim(alpha=0.5).to(FLAGS.device)
-    ema = ExponentialMovingAverage(beta=0.95).to(FLAGS.device)
+
+    converter = SentIndex2Report(index_to_word=MimicCXRDataset.index_to_word)
+    if not FLAGS.debug_disable_chexpert:
+        chexpert = DataParallelCPU(CheXpert, num_jobs=None, maxtasksperchild=256).to(FLAGS.device)
+        chexpert_aggregator = CheXpertAggregator().to(FLAGS.device)
+        mention_sim = MentionSim(alpha=0.5).to(FLAGS.device)
+        ema = ExponentialMovingAverage(beta=0.95).to(FLAGS.device)
 
     os.makedirs(working_dir)
     with open(os.path.join(working_dir, 'meta.json'), 'w') as f:
@@ -216,38 +219,40 @@ def train():
 
                         losses['word_ce'] = F.nll_loss(_log_probability, word)
 
-                    if mode & Mode.use_self_critical:
-                        report = converter(output['text'], output['sent_length'], output['text_length'])
-                        _report = converter(output['_text'][:, 0], output['_sent_length'][:, 0], output['_text_length'])
+                    if (mode & Mode.use_self_critical) | (mode & Mode.use_chexpert):
+                        reward = 0
+
+                        report = converter(output['text'], output['sent_length'], output['text_length'], is_eos=False)
+                        _report = converter(output['_text'][:, 0], output['_sent_length'][:, 0], output['_text_length'], is_eos=False)
                         # _report_sent = converter(output['_text'][:, 0], output['_sent_length'][:, 0], torch.ones_like(output['_sent_length'][:, 0]))
                         _sum_log_probability = pad_packed_sequence(output['_sum_log_probability'][:, 0], length=output['_text_length']).sum(1)
 
-                        with torch.no_grad():
-                            output_greedy = model(batch, phase=Phase.test, beam_size=1)
-                        _report_greedy = converter(output_greedy['_text'][:, 0], output_greedy['_sent_length'][:, 0], output_greedy['_text_length'])
+                        if mode & Mode.use_self_critical:
+                            with torch.no_grad():
+                                output_greedy = model(batch, phase=Phase.test, beam_size=1)
+                            _report_greedy = converter(output_greedy['_text'][:, 0], output_greedy['_sent_length'][:, 0], output_greedy['_text_length'], is_eos=False)
 
-                        reward = 0
+                            report_cider = cider(_report, report)
+                            report_cider_greedy = cider(_report_greedy, report)
+                            reward_report = report_cider - report_cider_greedy
+                            reward += reward_report
 
-                        report_cider = cider(_report, report)
-                        report_cider_greedy = cider(_report_greedy, report)
-                        reward_report = report_cider - report_cider_greedy
-                        reward += reward_report
+                            metrics['cider'] = report_cider.mean()
+                            metrics['reward_report'] = reward_report.mean()
 
-                        metrics['cider'] = report_cider.mean()
-                        metrics['reward_report'] = reward_report.mean()
+                        if mode & Mode.use_chexpert:
+                            if num_step % FLAGS.sim_steps == 0:
+                                # _chexpert_label_sent = chexpert(_report_sent)
+                                # _chexpert_label = chexpert_aggregator(_chexpert_label_sent, output['_text_length'])
+                                _chexpert_label = chexpert(_report)
+                                sim = mention_sim(_chexpert_label, output['chexpert_label'])
+                                sim_baseline = ema(sim.mean(0))
 
-                        if num_step % FLAGS.sim_steps == 0:
-                            # _chexpert_label_sent = chexpert(_report_sent)
-                            # _chexpert_label = chexpert_aggregator(_chexpert_label_sent, output['_text_length'])
-                            _chexpert_label = chexpert(_report)
-                            sim = mention_sim(_chexpert_label, output['chexpert_label'])
-                            sim_baseline = ema(sim.mean(0))
+                                metrics['sim'] = sim.mean()
 
-                            metrics['sim'] = sim.mean()
-
-                            reward_sim = (sim - sim_baseline).mean()
-                            reward += FLAGS.weight_sim * reward_sim
-                            metrics['reward_sim'] = reward_sim.mean()
+                                reward_sim = (sim - sim_baseline).mean()
+                                reward += FLAGS.weight_sim * reward_sim
+                                metrics['reward_sim'] = reward_sim.mean()
 
                         losses['REINFORCE'] = - (FLAGS.prob_anneal * _sum_log_probability * reward).mean()
                         metrics['reward'] = reward.mean()
@@ -295,8 +300,8 @@ def train():
                         })
 
                     if mode & Mode.gen_text:
-                        report = converter(output['text'], output['sent_length'], output['text_length'])
-                        _report = converter(output['_text'][:, 0], output['_sent_length'][:, 0], output['_text_length'])
+                        report = converter(output['text'], output['sent_length'], output['text_length'], is_eos=False)
+                        _report = converter(output['_text'][:, 0], output['_sent_length'][:, 0], output['_text_length'], is_eos=False)
 
                         for scorer in [bleu, rouge, cider]:
                             report_score = scorer(_report, report)
@@ -307,10 +312,11 @@ def train():
                             else:
                                 metrics[f'{scorer.method()}'] = report_score.mean()
 
-                        _chexpert_label = chexpert(_report)
-                        sim = mention_sim(_chexpert_label, output['chexpert_label'])
+                        if not FLAGS.debug_disable_chexpert:
+                            _chexpert_label = chexpert(_report)
+                            sim = mention_sim(_chexpert_label, output['chexpert_label'])
 
-                        metrics['sim'] = sim.mean()
+                            metrics['sim'] = sim.mean()
 
                         if FLAGS.do == 'test':
                             log_item.update({
@@ -391,6 +397,9 @@ def train():
         logger.info('\n'.join(
             [f'{key:s}: {log[key]:8.2e}' for key in log.keys()]
         ))
+
+    if not FLAGS.debug_disable_chexpert:
+        chexpert.close()
 
 
 test = train
@@ -595,7 +604,7 @@ if __name__ == '__main__':
         '__no_recurrent_label': version_of(FLAGS.ckpt_path) > 1548347568,
         '__image_encoder_relu': version_of(FLAGS.ckpt_path) > 1548428102,
         '__sample_text': version_of(FLAGS.ckpt_path) > 1548708003,
-        '__use_densenet': version_of(FLAGS.ckpt_path, ascend=True) > 1548881554,
+        '__use_densenet': (version_of(FLAGS.ckpt_path, ascend=True) > 1548881554) and not FLAGS.debug_use_resnet,
         '__no_temp': version_of(FLAGS.ckpt_path) > 1548881554,
     })
     logger.info(json.dumps(kwargs, indent=4))

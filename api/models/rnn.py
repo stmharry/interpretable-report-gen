@@ -28,9 +28,9 @@ def length_sorted_rnn(use_fields=None):
     return _length_sorted_rnn
 
 
-class ReportDecoder(Module):
+class SentenceDecoder(Module):
     def __init__(self, **kwargs):
-        super(ReportDecoder, self).__init__()
+        super(SentenceDecoder, self).__init__()
 
         self.view_position_size = kwargs['view_position_size']
         self.label_size         = kwargs['label_size']
@@ -129,7 +129,7 @@ class ReportDecoder(Module):
         for t in range(torch.max(length)):
             batch_size_t = torch.sum(length > t).item()
 
-            logger.debug(f'ReportDecoder.forward(): time_step={t}, num_reports={batch_size_t}')
+            logger.debug(f'SentenceDecoder.forward(): time_step={t}, num_reports={batch_size_t}')
 
             _batch = self._step({
                 'image_mean': image_mean[:batch_size_t],
@@ -196,7 +196,7 @@ class ReportDecoder(Module):
             batch_size_t = len(batch_index)
             batch_length = torch.sum(batch_index.view(-1, 1) == torch.arange(batch_size).view(1, -1).cuda(), 0)
 
-            logger.debug(f'ReportDecoder.decode(): time_step={t}, num_reports={batch_size_t}')
+            logger.debug(f'SentenceDecoder.decode(): time_step={t}, num_reports={batch_size_t}')
 
             _batch = self._step({
                 'image_mean': image_mean[batch_index],
@@ -254,9 +254,9 @@ class ReportDecoder(Module):
         return outputs
 
 
-class SentenceDecoder(Module):
+class WordDecoder(Module):
     def __init__(self, **kwargs):
-        super(SentenceDecoder, self).__init__()
+        super(WordDecoder, self).__init__()
 
         self.mode                = Mode[kwargs['mode']]
         self.image_size          = kwargs['image_size']
@@ -386,7 +386,7 @@ class SentenceDecoder(Module):
         for t in range(torch.max(length)):
             batch_size_t = torch.sum(length > t).item()
 
-            logger.debug(f'SentenceDecoder.forward(): time_step={t}, num_sentences={batch_size_t}')
+            logger.debug(f'WordDecoder.forward(): time_step={t}, num_sentences={batch_size_t}')
 
             _batch = self._step({
                 'image_mean': image_mean[:batch_size_t],
@@ -485,7 +485,7 @@ class SentenceDecoder(Module):
             batch_length = torch.sum(batch_index.view(-1, 1) == torch.arange(batch_size).view(1, -1).cuda(), 0)
             batch_begin = batch_length.sum() - batch_length.flip(0).cumsum(0).flip(0)
 
-            logger.debug(f'SentenceDecoder.decode(): time_step={t}, num_sentences={batch_size_t}')
+            logger.debug(f'WordDecoder.decode(): time_step={t}, num_sentences={batch_size_t}')
 
             _batch = self._step({
                 'image_mean': image_mean[batch_index],

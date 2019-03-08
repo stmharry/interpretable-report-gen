@@ -123,6 +123,10 @@ class DataParallelCPU(DeviceMixin):
 
         return objs
 
+    def close(self):
+        self.pool.close()
+        self.pool.join()
+
 
 class ExponentialMovingAverage(nn.Module):
     def __init__(self, beta=0.95):
