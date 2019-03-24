@@ -19,6 +19,7 @@ class Model(nn.Module):
         super(Model, self).__init__()
 
         self.mode           = Mode[kwargs['mode']]
+        self.dataset        = kwargs['dataset']
         self.image_size     = kwargs['image_size']
         self.embedding_size = kwargs['embedding_size']
         self.label_size     = kwargs['label_size']
@@ -36,15 +37,19 @@ class Model(nn.Module):
             else:
                 self.image_encoder = ResNet50(**kwargs)
 
+            if self.dataset == 'open-i':
+                for param in set(self.image_encoder.parameters()) - set(self.image_encoder.fc.parameters()):
+                    param.requires_grad = False
+
         if self.mode & Mode.gen_label_all:
             self.fc_label = nn.Linear(self.embedding_size, self.label_size)
             self.drop = nn.Dropout(self.dropout)
 
         if self.mode & Mode.gen_label:
-            self.sentence_decoder = SentenceDecoder(**kwargs)
+            self.report_decoder = SentenceDecoder(**kwargs)  # Naming for compat
 
         if self.mode & Mode.gen_text:
-            self.word_decoder = WordDecoder(**kwargs)
+            self.sentence_decoder = WordDecoder(**kwargs)
 
     @profile
     def forward(self, batch, phase, **kwargs):
@@ -64,10 +69,10 @@ class Model(nn.Module):
 
         if self.mode & Mode.gen_label:
             if (phase == Phase.train) and (self.mode & Mode.use_self_critical) or (phase in [Phase.val, Phase.test]):
-                output.update(self.sentence_decoder._test(output, **kwargs))
+                output.update(self.report_decoder._test(output, **kwargs))
                 _text_length = output['_text_length']
             else:
-                output.update(self.sentence_decoder._train(output, length=output['text_length'], **kwargs))
+                output.update(self.report_decoder._train(output, length=output['text_length'], **kwargs))
                 _text_length = output['text_length']
 
             for key in ['image', 'view_position']:
@@ -81,12 +86,12 @@ class Model(nn.Module):
                     output[key] = pack_padded_sequence(output[key], length=output['text_length'])
 
             if (phase == Phase.train) and (self.mode & Mode.use_teacher_forcing):
-                output.update(self.word_decoder._train(output, length=output['sent_length'], **kwargs))
+                output.update(self.sentence_decoder._train(output, length=output['sent_length'], **kwargs))
 
             elif (phase == Phase.train) and (self.mode & Mode.use_self_critical):
-                output.update(self.word_decoder._test(output, probabilistic=True, **kwargs))
+                output.update(self.sentence_decoder._test(output, probabilistic=True, **kwargs))
 
             elif phase in [Phase.val, Phase.test]:
-                output.update(self.word_decoder._test(output, probabilistic=False, **kwargs))
+                output.update(self.sentence_decoder._test(output, probabilistic=False, **kwargs))
 
         return output

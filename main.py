@@ -33,7 +33,7 @@ from mimic_cxr.data import MIMIC_CXR
 from mimic_cxr.utils import Log
 
 from api import Mode, Phase
-from api.datasets import MimicCXRDataset
+from api.datasets import MimicCXRDataset, OpenIDataset
 from api.data_loader import CollateFn
 from api.models import Model
 from api.models.base import DataParallelCPU, ExponentialMovingAverage
@@ -47,6 +47,7 @@ from api.utils.rnn import pack_padded_sequence, pad_packed_sequence
 """ Global
 """
 flags.DEFINE_string('do', 'train', 'Function to execute (default: "train")')
+flags.DEFINE_enum('dataset', None, ['mimic-cxr', 'open-i'], 'Dataset to use')
 flags.DEFINE_enum('split', 'test', ['val', 'test'], 'Split to validate/visualize for')
 flags.DEFINE_enum('mode', None, list(Mode.__members__.keys()), 'Training mode (' + ' or '.join(map('"{}"'.format, Mode.__members__)) + ')')
 flags.DEFINE_string('device', 'cuda', 'GPU device to use (default: "cuda")')
@@ -65,9 +66,6 @@ flags.DEFINE_integer('image_size', 8, 'Image feature map size (default: 8)')
 """ Text
 """
 flags.DEFINE_string('field', 'findings', 'The field to use in text reports (default: "findings")')
-flags.DEFINE_integer('min_word_freq', 5, 'Minimum frequency of words in vocabulary (default: 5)')
-flags.DEFINE_integer('max_report_length', 16, 'Maximum number of sentences in a report (default: 16)')
-flags.DEFINE_integer('max_sentence_length', 48, 'Maximum number of words in a sentence (default: 48)')
 flags.DEFINE_integer('beam_size', 4, 'Beam size at testing (default: 4)')
 flags.DEFINE_float('alpha', 0.65, 'Power for length penaly (default: 0.65)')
 flags.DEFINE_float('beta', 5.0, 'Base for length penaly (default: 5.0)')
@@ -121,9 +119,9 @@ def train():
 
     bleu = Bleu(4).to(FLAGS.device)
     rouge = Rouge().to(FLAGS.device)
-    cider = Cider(df_cache=MimicCXRDataset.df_cache).to(FLAGS.device)
+    cider = Cider(df_cache=Dataset.df_cache).to(FLAGS.device)
 
-    converter = SentIndex2Report(index_to_word=MimicCXRDataset.index_to_word)
+    converter = SentIndex2Report(index_to_word=Dataset.index_to_word)
     if not FLAGS.debug_disable_chexpert:
         chexpert = DataParallelCPU(CheXpert, num_jobs=None, maxtasksperchild=256).to(FLAGS.device)
         chexpert_aggregator = CheXpertAggregator().to(FLAGS.device)
@@ -222,15 +220,15 @@ def train():
                     if (mode & Mode.use_self_critical) | (mode & Mode.use_chexpert):
                         reward = 0
 
-                        report = converter(output['text'], output['sent_length'], output['text_length'], is_eos=False)
-                        _report = converter(output['_text'][:, 0], output['_sent_length'][:, 0], output['_text_length'], is_eos=False)
+                        report = converter(output['text'], output['sent_length'], output['text_length'])
+                        _report = converter(output['_text'][:, 0], output['_sent_length'][:, 0], output['_text_length'])
                         # _report_sent = converter(output['_text'][:, 0], output['_sent_length'][:, 0], torch.ones_like(output['_sent_length'][:, 0]))
                         _sum_log_probability = pad_packed_sequence(output['_sum_log_probability'][:, 0], length=output['_text_length']).sum(1)
 
                         if mode & Mode.use_self_critical:
                             with torch.no_grad():
                                 output_greedy = model(batch, phase=Phase.test, beam_size=1)
-                            _report_greedy = converter(output_greedy['_text'][:, 0], output_greedy['_sent_length'][:, 0], output_greedy['_text_length'], is_eos=False)
+                            _report_greedy = converter(output_greedy['_text'][:, 0], output_greedy['_sent_length'][:, 0], output_greedy['_text_length'])
 
                             report_cider = cider(_report, report)
                             report_cider_greedy = cider(_report_greedy, report)
@@ -245,8 +243,10 @@ def train():
                                 # _chexpert_label_sent = chexpert(_report_sent)
                                 # _chexpert_label = chexpert_aggregator(_chexpert_label_sent, output['_text_length'])
                                 _chexpert_label = chexpert(_report)
+                                # TODO(stmharry): optimize F1?
                                 sim = mention_sim(_chexpert_label, output['chexpert_label'])
-                                sim_baseline = ema(sim.mean(0))
+                                # sim_baseline = ema(sim.mean(0))
+                                sim_baseline = 0.5
 
                                 metrics['sim'] = sim.mean()
 
@@ -416,7 +416,7 @@ def vis():
     }[FLAGS.split]
 
     log = Log()
-    converter = SentIndex2Report(index_to_word=MimicCXRDataset.index_to_word)
+    converter = SentIndex2Report(index_to_word=Dataset.index_to_word)
 
     image_dir = os.path.join(working_dir, 'imgs')
     os.makedirs(image_dir)
@@ -471,7 +471,7 @@ def vis():
                 for num_beam in range(FLAGS.beam_size):
                     num_words = _sent_length[num_report, num_sentence, num_beam]
                     _sentence = _text[num_report, num_sentence, num_beam]
-                    _words = MimicCXRDataset.index_to_word[to_numpy(_sentence[:num_words])]
+                    _words = Dataset.index_to_word[to_numpy(_sentence[:num_words])]
 
                     beam_texts = []
                     for num_word in range(num_words):
@@ -512,7 +512,7 @@ def vis():
                         'labels': [{
                             'label': label_col,
                             'prob': to_str(_l),
-                        } for (label_col, _l) in zip(MimicCXRDataset.label_columns, _label[num_report, num_sentence])],
+                        } for (label_col, _l) in zip(Dataset.label_columns, _label[num_report, num_sentence])],
                     })
 
                 if mode & Mode.gen_text:
@@ -567,36 +567,6 @@ if __name__ == '__main__':
         FLAGS.max_report_length = 1
         FLAGS.max_sentence_length = 120
 
-    logger.info('Loading MIMIC-CXR')
-    mimic_cxr = MIMIC_CXR()
-
-    logger.info('Loading meta')
-    df_meta = pd.read_csv(mimic_cxr.meta_path())
-
-    logger.info('Loading text features')
-    df_rad = pd.read_csv(mimic_cxr.corpus_path(field=FLAGS.field), sep='\t', dtype=str)
-
-    logger.info('Loading image features')
-    df_dicom = pd.Series(os.listdir(mimic_cxr.image_path())).str.split('.', expand=True)[0].rename('dicom_id').to_frame()
-
-    on_dfs = [
-        ('rad_id', df_rad),
-        ('dicom_id', df_meta),
-        ('dicom_id', df_dicom),
-    ]
-    df = mimic_cxr.inner_merge(on_dfs)
-    logger.info(f'Dataset size={len(df)}')
-
-    train_size = int(0.875 * len(mimic_cxr.train_subject_ids))
-    train_df = df[df.subject_id.isin(mimic_cxr.train_subject_ids[:train_size])]
-    val_df = df[df.subject_id.isin(mimic_cxr.train_subject_ids[train_size:])]
-    test_df = df[df.subject_id.isin(mimic_cxr.test_subject_ids)]
-
-    if FLAGS.debug_subsample:
-        train_df = train_df.sample(n=100)
-        val_df = val_df.sample(n=100)
-        test_df = test_df.sample(n=100)
-
     version = version_of(FLAGS.ckpt_path)
     kwargs = FLAGS.flag_values_dict()
     kwargs.update({
@@ -609,28 +579,79 @@ if __name__ == '__main__':
     })
     logger.info(json.dumps(kwargs, indent=4))
 
-    Dataset = functools.partial(
-        MimicCXRDataset,
-        field=FLAGS.field,
-        min_word_freq=FLAGS.min_word_freq,
-        max_report_length=FLAGS.max_report_length,
-        max_sentence_length=FLAGS.max_sentence_length,
-        embedding_size=FLAGS.embedding_size,
-        kwargs=kwargs,
-    )
-    dataset = Dataset(df=df, phase=None)
+    if FLAGS.dataset == 'mimic-cxr':
+        Dataset = MimicCXRDataset
+
+        logger.info('Loading MIMIC-CXR')
+        mimic_cxr = MIMIC_CXR()
+
+        logger.info('Loading meta')
+        df_meta = pd.read_csv(mimic_cxr.meta_path())
+
+        logger.info('Loading text features')
+        df_rad = pd.read_csv(mimic_cxr.corpus_path(field=FLAGS.field), sep='\t', dtype=str)
+
+        logger.info('Loading image features')
+        df_dicom = pd.Series(os.listdir(mimic_cxr.image_path())).str.split('.', expand=True)[0].rename('dicom_id').to_frame()
+
+        on_dfs = [
+            ('rad_id', df_rad),
+            ('dicom_id', df_meta),
+            ('dicom_id', df_dicom),
+        ]
+        df = mimic_cxr.inner_merge(on_dfs)
+        logger.info(f'Dataset size={len(df)}')
+
+        train_size = int(0.875 * len(mimic_cxr.train_subject_ids))
+        train_df = df[df.subject_id.isin(mimic_cxr.train_subject_ids[:train_size])]
+        val_df = df[df.subject_id.isin(mimic_cxr.train_subject_ids[train_size:])]
+        test_df = df[df.subject_id.isin(mimic_cxr.test_subject_ids)]
+
+        if FLAGS.debug_subsample:
+            train_df = train_df.sample(n=100)
+            val_df = val_df.sample(n=100)
+            test_df = test_df.sample(n=100)
+
+        Dataset = MimicCXRDataset
+        _Dataset = functools.partial(
+            Dataset,
+            field=FLAGS.field,
+            min_word_freq=5,
+            max_report_length=16,
+            max_sentence_length=48,
+            embedding_size=FLAGS.embedding_size,
+            kwargs=kwargs,
+        )
+        dataset       = _Dataset(df=df,       phase=None)
+        train_dataset = _Dataset(df=train_df, phase=Phase.train)
+        val_dataset   = _Dataset(df=val_df,   phase=Phase.val)
+        test_dataset  = _Dataset(df=test_df,  phase=Phase.test)
+
+    elif FLAGS.dataset == 'open-i':
+        Dataset = OpenIDataset
+        _Dataset = functools.partial(
+            Dataset,
+            field=FLAGS.field,
+            min_word_freq=3,
+            max_report_length=10,
+            max_sentence_length=20,
+            embedding_size=FLAGS.embedding_size,
+            kwargs=kwargs,
+        )
+        dataset       = _Dataset(phase=None)
+        train_dataset = _Dataset(phase=Phase.train)
+        val_dataset   = _Dataset(phase=Phase.val)
+        test_dataset  = _Dataset(phase=Phase.test)
 
     kwargs.update({
-        'word_embedding': MimicCXRDataset.word_embedding,
-        'index_to_word': MimicCXRDataset.index_to_word,
-        'word_to_index': MimicCXRDataset.word_to_index,
-        'view_position_size': MimicCXRDataset.view_position_size,
-        'label_size': MimicCXRDataset.label_size,
+        'max_report_length': dataset.max_report_length,
+        'max_sentence_length': dataset.max_sentence_length,
+        'word_embedding': dataset.word_embedding,
+        'index_to_word': dataset.index_to_word,
+        'word_to_index': dataset.word_to_index,
+        'view_position_size': dataset.view_position_size,
+        'label_size': dataset.label_size,
     })
-
-    train_dataset = Dataset(df=train_df, phase=Phase.train)
-    val_dataset   = Dataset(df=val_df,   phase=Phase.val)
-    test_dataset  = Dataset(df=test_df,  phase=Phase.test)
 
     DataLoader = functools.partial(
         torch.utils.data.DataLoader,
