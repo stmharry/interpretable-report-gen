@@ -413,19 +413,19 @@ class OpenIDataset(Dataset):
             self._make_meta()
 
         if OpenIDataset.df_meta is None:
-            OpenIDataset.df_meta = pd.read_csv(self._meta_path(), sep='\t').set_index('rad_id')
+            OpenIDataset.df_meta = pd.read_csv(self._meta_path(), sep='\t')
 
         if (phase is None) and (not os.path.isfile(self._report_chexpert_path())):
             self._make_report_chexpert()
 
         if OpenIDataset.df_report is None:
-            OpenIDataset.df_report = pd.read_csv(self._report_chexpert_path(), sep='\t').set_index('rad_id')
+            OpenIDataset.df_report = pd.read_csv(self._report_chexpert_path(), sep='\t')
 
         if (phase is None) and (not os.path.isfile(self._sentence_path())):
             self._make_sentence()
 
         if OpenIDataset.df_sentence is None:
-            OpenIDataset.df_sentence = pd.read_csv(self._sentence_path(), sep='\t').set_index('rad_id')
+            OpenIDataset.df_sentence = pd.read_csv(self._sentence_path(), sep='\t')
             OpenIDataset.label_size = 1
 
         if (phase is None) and (not os.path.isfile(self._cider_cache_path())):
@@ -447,20 +447,20 @@ class OpenIDataset(Dataset):
                     np.zeros((1, embedding_size)),
                 ], axis=0).astype(np.float32)
 
-        df = OpenIDataset.df_meta.join(OpenIDataset.df_report, how='inner')
+        df = OpenIDataset.df_meta.merge(OpenIDataset.df_report, on='rad_id', how='inner')
         if phase == Phase.train:
             rad_ids = pd.read_csv(os.path.join(os.getenv('CACHE_DIR'), 'open-i', f'train_ids.csv')).squeeze()
-            self.df = df[df.index.isin(rad_ids.values)]
+            self.df = df[df.rad_id.isin(rad_ids.values)]
         else:
             rad_ids = pd.read_csv(os.path.join(os.getenv('CACHE_DIR'), 'open-i', f'test_ids.csv')).squeeze()
-            self.df = df[df.index.isin(rad_ids.values)]
+            self.df = df[df.rad_id.isin(rad_ids.values)]
 
     def __len__(self):
         return len(self.df)
 
     def __getitem__(self, index):
         item = self.df.iloc[index]
-        df_rad = self.df.loc[self.df.index == item.name]
+        df_rad = self.df.loc[self.df.rad_id == item.rad_id]
 
         _item = {
             'item_index': index,
@@ -493,7 +493,7 @@ class OpenIDataset(Dataset):
         text = []
         sent_length = []
 
-        df_sentence = self.df_sentence.loc[item.name]
+        df_sentence = self.df_sentence.loc[self.df_sentence.rad_id == item.rad_id]
         if self.mode & Mode.as_one_sentence:
             sentences = [' '.join(df_sentence.sentence)]
         else:
@@ -516,7 +516,7 @@ class OpenIDataset(Dataset):
         sent_length = torch.as_tensor(sent_length, dtype=torch.long)
         text_length = torch.as_tensor(sent_length.numel(), dtype=torch.long)
 
-        df_chexpert_label = self.df_report.loc[item.name]
+        df_chexpert_label = self.df_report.loc[self.df_report.rad_id == item.rad_id].squeeze()
         chexpert_label = torch.as_tensor(df_chexpert_label[CATEGORIES].values.astype(np.int64), dtype=torch.long)
 
         num = torch.arange(text_length, dtype=torch.long).unsqueeze(1)

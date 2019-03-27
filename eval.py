@@ -16,6 +16,7 @@ from api.metrics import Bleu, Rouge, CiderD as Cider, MentionSim
 from api.utils import to_numpy
 
 flags.DEFINE_string('do', None, '')
+flags.DEFINE_enum('dataset', None, ['mimic-cxr', 'open-i'], 'Dataset to use')
 flags.DEFINE_string('raw', None, '')
 flags.DEFINE_string('cache', None, '')
 flags.DEFINE_list('remove_tokens', [], '')
@@ -27,27 +28,28 @@ def compile():
 
     bleu = Bleu(4)
     rouge = Rouge()
-    cider = Cider(df_cache=torch.load(os.path.join(os.getenv('CACHE_DIR'), 'cider-cache.pkl')))
+    cider = Cider(df_cache=torch.load(os.path.join(cache_dir, 'cider-cache.pkl')))
 
     _df = pd.read_csv(FLAGS.raw, sep='\t').fillna('')
-    df_sentence = pd.read_csv(os.path.join(os.getenv('CACHE_DIR'), f'sentence-label-field-findings.tsv'), sep='\t')
-    df_chexpert = pd.read_csv(os.path.join(os.getenv('CACHE_DIR'), f'report-chexpert-field-findings.tsv'), sep='\t')
+    _df = _df.rename(columns={'pred_text': 'text'})
+
+    df_sentence = pd.read_csv(df_sentence_path, sep='\t')
+    df_report = pd.read_csv(df_report_path, sep='\t')
 
     rad_ids = set(_df.rad_id) & set(df_sentence.rad_id)
     df = pd.merge(
         df_sentence.loc[df_sentence.rad_id.isin(rad_ids)].groupby('rad_id').sentence.apply(' '.join).rename('text').reset_index(),
-        df_chexpert.loc[df_chexpert.rad_id.isin(rad_ids)],
+        df_report.loc[df_report.rad_id.isin(rad_ids)].drop(columns='text', errors='ignore'),
+        on='rad_id',
     )
 
     _df = _df[_df.rad_id.isin(rad_ids)]
-    df = _df[['rad_id']].merge(df)
+    df = _df[['rad_id']].merge(df, on='rad_id', how='left')
 
     df_metric = pd.DataFrame(
         {'rad_id': _df.rad_id},
         index=range(len(_df)),
     )
-
-    print('Evaluating NLP metrics...')
 
     for index in tqdm.trange(len(_df)):
         _text = _df.text.iloc[index]
@@ -130,7 +132,7 @@ def calc():
             metric = tp / (tp + fn + epsilon)
             micro_metric = tps / (tps + fns + epsilon)
 
-        if name in ['Precision']:
+        if name in ['Accuracy', 'Precision']:
             for (num, category) in enumerate(chexpert_labeler.CATEGORIES):
                 df_metric[f'{category} ({name})'] = metric[num]
 
@@ -148,5 +150,15 @@ def calc():
 
 if __name__ == '__main__':
     argv = FLAGS(sys.argv)
+
+    if FLAGS.dataset == 'mimic-cxr':
+        cache_dir = os.getenv('CACHE_DIR')
+        df_sentence_path = os.path.join(cache_dir, f'sentence-label-field-findings.tsv')
+        df_report_path = os.path.join(cache_dir, f'report-chexpert-field-findings.tsv')
+
+    elif FLAGS.dataset == 'open-i':
+        cache_dir = os.path.join(os.getenv('CACHE_DIR'), 'open-i')
+        df_sentence_path = os.path.join(cache_dir, f'sentence-field-findings.tsv')
+        df_report_path = os.path.join(cache_dir, f'report-chexpert-field-findings.tsv')
 
     locals()[FLAGS.do]()

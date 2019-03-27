@@ -37,9 +37,11 @@ class Model(nn.Module):
             else:
                 self.image_encoder = ResNet50(**kwargs)
 
+            '''
             if self.dataset == 'open-i':
                 for param in set(self.image_encoder.parameters()) - set(self.image_encoder.fc.parameters()):
                     param.requires_grad = False
+            '''
 
         if self.mode & Mode.gen_label_all:
             self.fc_label = nn.Linear(self.embedding_size, self.label_size)
@@ -68,7 +70,7 @@ class Model(nn.Module):
             output['_label'] = torch.sigmoid(self.fc_label(self.drop(output['image'].mean(1))))
 
         if self.mode & Mode.gen_label:
-            if (phase == Phase.train) and (self.mode & Mode.use_self_critical) or (phase in [Phase.val, Phase.test]):
+            if (phase == Phase.train) and ((self.mode & Mode.use_self_critical) or (self.mode & Mode.use_chexpert)) or (phase in [Phase.val, Phase.test]):
                 output.update(self.report_decoder._test(output, **kwargs))
                 _text_length = output['_text_length']
             else:
@@ -88,7 +90,7 @@ class Model(nn.Module):
             if (phase == Phase.train) and (self.mode & Mode.use_teacher_forcing):
                 output.update(self.sentence_decoder._train(output, length=output['sent_length'], **kwargs))
 
-            elif (phase == Phase.train) and (self.mode & Mode.use_self_critical):
+            elif (phase == Phase.train) and ((self.mode & Mode.use_self_critical) or (self.mode & Mode.use_chexpert)):
                 output.update(self.sentence_decoder._test(output, probabilistic=True, **kwargs))
 
             elif phase in [Phase.val, Phase.test]:

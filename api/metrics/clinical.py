@@ -40,6 +40,8 @@ class MentionSim(nn.Module):
         ), requires_grad=False)
 
     def forward(self, input_, target):
+        assert input_.shape == target.shape
+
         lookup = input_ * MentionSim.mention_size + target
         sim = self._sim_lookup[lookup]
 

@@ -246,7 +246,8 @@ def train():
                                 # TODO(stmharry): optimize F1?
                                 sim = mention_sim(_chexpert_label, output['chexpert_label'])
                                 # sim_baseline = ema(sim.mean(0))
-                                sim_baseline = 0.5
+                                sim_baseline = ema(sim.mean())
+                                # sim_baseline = 0.5
 
                                 metrics['sim'] = sim.mean()
 
@@ -355,7 +356,7 @@ def train():
                     break
 
             if phase == Phase.train:
-                if num_epoch % FLAGS.save_epochs == 0:
+                if (num_epoch % FLAGS.save_epochs == 0) or (num_epoch == FLAGS.num_epochs - 1):
                     torch.save(model.state_dict(), os.path.join(working_dir, f'model-epoch-{num_epoch}.pth'))
                     torch.save(optimizer.state_dict(), os.path.join(working_dir, f'optimizer-epoch-{num_epoch}.pth'))
 
@@ -409,18 +410,24 @@ def vis():
     def to_str(x):
         return '{:.2f}'.format(x.item())
 
-    phase = FLAGS.split
-    (data_loader, dataset) = {
-        Phase.val: (val_loader, val_dataset),
-        Phase.test: (test_loader, test_dataset),
-    }[FLAGS.split]
+    assert FLAGS.dataset == 'mimic-cxr'
+
+    phase = Phase.test
+    dataset = test_dataset
+    data_loader = test_loader
+
+    if FLAGS.ckpt_path:
+        logger.info(f'Loading model from {FLAGS.ckpt_path}')
+        load_state_dict(model, torch.load(FLAGS.ckpt_path))
 
     log = Log()
     converter = SentIndex2Report(index_to_word=Dataset.index_to_word)
 
+    working_dir = os.path.join(FLAGS.working_dir, 'vis', datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S-%f'))
     image_dir = os.path.join(working_dir, 'imgs')
     os.makedirs(image_dir)
 
+    reports = []
     prog = tqdm.tqdm(enumerate(data_loader), total=len(data_loader))
     for (num_batch, batch) in prog:
         for (key, value) in batch.items():
@@ -430,7 +437,7 @@ def vis():
         metrics = {}
 
         with torch.no_grad():
-            batch = model(batch, phase=phase, beam_size=FLAGS.beam_size, alpha=FLAGS.alpha, beta=FLAGS.beta)
+            batch = model(batch, phase=Phase.test, beam_size=FLAGS.beam_size)
 
         _log = {**losses, **metrics}
         log.update(_log)
@@ -440,13 +447,9 @@ def vis():
             [f'{key:s}: {log[key]:8.2e}' for key in sorted(losses.keys())]
         ))
 
-        if FLAGS.split == 'val':
-            report_texts = convert(batch['text'], batch['sent_length'], batch['text_length'])
-
-        item_index = batch['item_index']
+        item_index = to_numpy(batch['item_index'])
         _text_length = batch['_text_length']  # (num_reports,)
         (
-            _label,                # (num_reports, max_num_sentences, label_size)
             _stop,                 # (num_reports, max_num_sentences, 1)
             _temp,                 # (num_reports, max_num_sentences, 1)
             _attention,            # (num_repoers, max_num_sentences, beam_size, max_num_words, 65)
@@ -456,12 +459,13 @@ def vis():
             _sent_length,          # (num_reports, max_num_sentences, beam_size)
         ) = [
             pad_packed_sequence(batch[key], length=_text_length)
-            for key in ['_label', '_stop', '_temp', '_attention', '_score', '_sum_log_probability', '_text', '_sent_length']
+            for key in ['_stop', '_temp', '_attention', '_score', '_sum_log_probability', '_text', '_sent_length']
         ]
 
         (fig, ax) = plot.subplots(1, figsize=(6, 6), gridspec_kw={'left': 0, 'right': 1, 'bottom': 0, 'top': 1})
-        reports = []
         for num_report in range(len(_text_length)):
+            num = num_batch * FLAGS.batch_size + num_report
+
             item = dataset.df.iloc[int(item_index[num_report])]
             image_path = mimic_cxr.image_path(dicom_id=item.dicom_id)
 
@@ -473,12 +477,15 @@ def vis():
                     _sentence = _text[num_report, num_sentence, num_beam]
                     _words = Dataset.index_to_word[to_numpy(_sentence[:num_words])]
 
-                    beam_texts = []
+                    texts = []
                     for num_word in range(num_words):
-                        _attention_path = os.path.join(image_dir, f'{num_report}-{num_sentence}-{num_beam}-{num_word}.png')
+                        _attention_path = os.path.join(image_dir, f'{num}-{num_sentence}-{num_beam}-{num_word}.png')
+                        print(_attention_path)
 
+                        # texts.append(span(_words[num_word]))
                         _a = _attention[num_report, num_sentence, num_beam, num_word, :FLAGS.image_size * FLAGS.image_size]
                         _a_sum = _a.sum()
+                        _a = _a - _a.min()
                         _a = _a / _a.max()
                         _a = _a.reshape(FLAGS.image_size, FLAGS.image_size)
                         _a = F.interpolate(_a[None, None, :], scale_factor=(8, 8), mode='bilinear', align_corners=True)[0, 0]
@@ -487,9 +494,9 @@ def vis():
                         ax.set_axis_off()
 
                         fig.savefig(_attention_path, bbox_inches=0)
-                        fig.clf()
+                        ax.cla()
 
-                        beam_texts.append(span(html.escape(_words[num_word]), **{
+                        texts.append(span(_words[num_word], **{
                             'data-toggle': 'tooltip',
                             'title': (
                                 p('Total attention: ' + to_str(_a_sum)) +
@@ -500,7 +507,7 @@ def vis():
                     beams.append({
                         'score': to_str(_score[num_report, num_sentence, num_beam]),
                         'log_prob': to_str(_sum_log_probability[num_report, num_sentence, num_beam]),
-                        'text': str('\n'.join(beam_texts)),
+                        'text': str('\n'.join(texts)),
                     })
 
                 sentence = {}
@@ -522,16 +529,15 @@ def vis():
 
                 sentences.append(sentence)
 
-            report = {
+            reports.append({
+                'rad_id': str(dataset.df.rad_id.iloc[item_index[num_report]]),
+                'dicom_id': str(dataset.df.dicom_id.iloc[item_index[num_report]]),
                 'image': str(img(src=f'http://monday.csail.mit.edu/xiuming{image_path}', width='256')),
                 'generated text': sentences,
-            }
-            if FLAGS.split == 'val':
-                report['ground truth text'] = report_texts[num_report]
+                'ground truth text': converter(batch['text'][num_report], batch['sent_length'][num_report], batch['text_length'][num_report], is_eos=False)[0],
+            })
 
-            reports.append(report)
-
-        if num_batch == 1:
+        if num_batch == 0:
             break
 
     s = json2html.convert(json=reports, table_attributes='class="table table-striped"', escape=False)
@@ -563,9 +569,6 @@ if __name__ == '__main__':
     mode = Mode[FLAGS.mode]
     if FLAGS.debug:
         FLAGS.num_workers = 0
-    if mode & Mode.as_one_sentence:
-        FLAGS.max_report_length = 1
-        FLAGS.max_sentence_length = 120
 
     version = version_of(FLAGS.ckpt_path)
     kwargs = FLAGS.flag_values_dict()
@@ -612,13 +615,20 @@ if __name__ == '__main__':
             val_df = val_df.sample(n=100)
             test_df = test_df.sample(n=100)
 
+        if mode & Mode.as_one_sentence:
+            max_report_length = 1
+            max_sentence_length = 120
+        else:
+            max_report_length = 16
+            max_sentence_length = 48
+
         Dataset = MimicCXRDataset
         _Dataset = functools.partial(
             Dataset,
             field=FLAGS.field,
             min_word_freq=5,
-            max_report_length=16,
-            max_sentence_length=48,
+            max_report_length=max_report_length,
+            max_sentence_length=max_sentence_length,
             embedding_size=FLAGS.embedding_size,
             kwargs=kwargs,
         )
@@ -628,13 +638,20 @@ if __name__ == '__main__':
         test_dataset  = _Dataset(df=test_df,  phase=Phase.test)
 
     elif FLAGS.dataset == 'open-i':
+        if mode & Mode.as_one_sentence:
+            max_report_length = 1
+            max_sentence_length = 90
+        else:
+            max_report_length = 10
+            max_sentence_length = 20
+
         Dataset = OpenIDataset
         _Dataset = functools.partial(
             Dataset,
             field=FLAGS.field,
             min_word_freq=3,
-            max_report_length=10,
-            max_sentence_length=20,
+            max_report_length=max_report_length,
+            max_sentence_length=max_sentence_length,
             embedding_size=FLAGS.embedding_size,
             kwargs=kwargs,
         )
@@ -662,7 +679,7 @@ if __name__ == '__main__':
     )
     train_loader = DataLoader(dataset=train_dataset, shuffle=True)
     val_loader   = DataLoader(dataset=val_dataset,   shuffle=True)
-    test_loader  = DataLoader(dataset=test_dataset,  shuffle=False)
+    test_loader  = DataLoader(dataset=test_dataset,  shuffle=True)
 
     model = Model(**kwargs)
     model = DataParallel(model).to(FLAGS.device)

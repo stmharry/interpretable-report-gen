@@ -27,6 +27,7 @@ class Mode(enum.Flag):
     pretrain    = enc_image | enc_with_attention | gen_label | use_label_ce | use_stop_bce
     full_tf     = enc_image | enc_with_attention | gen_label | gen_text | use_stop_bce | use_teacher_forcing
     full_sc     = enc_image | enc_with_attention | gen_label | gen_text | use_self_critical
+    full_chex   = enc_image | enc_with_attention | gen_label | gen_text | use_chexpert
     full        = enc_image | enc_with_attention | gen_label | gen_text | use_self_critical | use_chexpert
 
 
