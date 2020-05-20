@@ -3,7 +3,7 @@ import numpy as np
 import psutil
 import os
 import re
-# import grequests
+import grequests
 import torch
 import torch.nn as nn
 
@@ -91,7 +91,7 @@ class CheXpert(DeviceMixin):
             self.classifier.classify(loader.collection)
             labels = self.aggregator.aggregate(loader.collection)
 
-        except:
+        except Exception:
             labels = np.asarray([[1] + [np.nan] * (len(chexpert_labeler.CATEGORIES) - 1)] * size)
 
         labels = torch.as_tensor(labels, device=self.device)
@@ -123,7 +123,6 @@ class CheXpertAggregator(nn.Module):
         return torch.stack(chexpert_labels, 0)
 
 
-'''
 class CheXpertRemote(DeviceMixin):
     def __init__(self, urls, local):
         super(CheXpertRemote).__init__()
@@ -147,4 +146,3 @@ class CheXpertRemote(DeviceMixin):
         return torch.cat(objs)
 
     __call__ = forward
-'''

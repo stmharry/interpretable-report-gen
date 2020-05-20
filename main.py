@@ -11,6 +11,7 @@ import multiprocessing
 import numpy as np
 import os
 import pandas as pd
+import PIL.Image
 import re
 import sklearn.metrics
 import sys
@@ -422,6 +423,7 @@ def vis():
 
     log = Log()
     converter = SentIndex2Report(index_to_word=Dataset.index_to_word)
+    chexpert = CheXpert()
 
     working_dir = os.path.join(FLAGS.working_dir, 'vis', datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S-%f'))
     image_dir = os.path.join(working_dir, 'imgs')
@@ -488,13 +490,17 @@ def vis():
                         _a = _a - _a.min()
                         _a = _a / _a.max()
                         _a = _a.reshape(FLAGS.image_size, FLAGS.image_size)
-                        _a = F.interpolate(_a[None, None, :], scale_factor=(8, 8), mode='bilinear', align_corners=True)[0, 0]
+                        _a = F.interpolate(_a[None, None, :], scale_factor=(32, 32), mode='bilinear', align_corners=False)[0, 0]
 
-                        ax.contourf(to_numpy(_a), cmap='Reds')
+                        '''
+                        ax.contourf(to_numpy(_a), cmap='gray')
                         ax.set_axis_off()
 
                         fig.savefig(_attention_path, bbox_inches=0)
                         ax.cla()
+                        '''
+                        _a = 255 * to_numpy(_a)
+                        PIL.Image.fromarray(_a.astype(np.uint8)).save(_attention_path)
 
                         texts.append(span(_words[num_word], **{
                             'data-toggle': 'tooltip',
@@ -636,6 +642,13 @@ if __name__ == '__main__':
         train_dataset = _Dataset(df=train_df, phase=Phase.train)
         val_dataset   = _Dataset(df=val_df,   phase=Phase.val)
         test_dataset  = _Dataset(df=test_df,  phase=Phase.test)
+
+        test_dataset.df = test_dataset.df[test_dataset.df.dicom_id.isin([
+            '800c3c94-5634470f-7f5ea260-7a52a0dd-0518d883',
+            '23a5cd3b-6bb29875-b1984d7c-7987bdb4-cff71cef',
+            '1113de15-6d93228b-45975de8-dc8629bf-21c5ef1e',
+            'b6c97d96-e1901a01-90cce9f0-c4d86851-59d7054f',
+        ])]
 
     elif FLAGS.dataset == 'open-i':
         if mode & Mode.as_one_sentence:
