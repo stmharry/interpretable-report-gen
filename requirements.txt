@@ -6,7 +6,7 @@ htmltag==1.7
 joblib==0.12.2
 json2html==1.2.1
 negbio==0.9.3
-nltk==3.4
+nltk==3.4.5
 pandas==0.23.4
 pathlib2==2.3.3
 Pillow==5.2.0
