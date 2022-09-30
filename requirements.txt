@@ -3,7 +3,7 @@ bioc==1.1.dev3
 bllipparser==2016.9.11
 gensim==3.6.0
 htmltag==1.7
-joblib==0.12.2
+joblib==1.2.0
 json2html==1.2.1
 negbio==0.9.3
 nltk==3.4
