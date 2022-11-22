@@ -9,7 +9,7 @@ negbio==0.9.3
 nltk==3.4
 pandas==0.23.4
 pathlib2==2.3.3
-Pillow==5.2.0
+Pillow==9.3.0
 scikit-learn==0.19.1
 sphinx==1.8.3
 tensorboardX==1.4
